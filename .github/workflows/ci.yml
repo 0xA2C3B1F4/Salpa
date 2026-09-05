@@ -1,0 +1,277 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  public-tree:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned host dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements-build.txt
+          python3 -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r requirements-dev.txt
+      - name: Compile publication tools
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pycache
+        run: python3 -m py_compile scripts/*.py tools/*.py
+      - name: Test USB update host protocol
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Validate source or generated public tree
+        run: |
+          if test -f source-export.json; then
+            python3 scripts/check_public_tree.py export .
+            python3 scripts/check_public_history.py
+            repository="$PWD"
+            cd "$RUNNER_TEMP"
+            python3 "$repository/scripts/check_public_history.py"
+          else
+            python3 scripts/check_public_tree.py source
+          fi
+      - name: Install pinned Rust for manifest metadata
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.97.0"
+      - name: Validate release manifest policy
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.0"
+        run: |
+          python3 scripts/check_partition_layouts.py
+          python3 scripts/check_efuse_plan.py --self-test
+          python3 scripts/check_security_profiles.py
+          artifact="${RUNNER_TEMP}/not-a-firmware.bin"
+          printf 'manifest policy test\n' > "$artifact"
+          python3 scripts/record_release_candidate.py \
+            --artifact "$artifact" \
+            --output "${RUNNER_TEMP}/candidate.json" \
+            --mcu esp32s2 \
+            --features mcu-esp32s2,ctaphid-bringup,fido-stack \
+            --security-profile wemos-s2-mini-development
+          test -s "${RUNNER_TEMP}/candidate.json"
+          if python3 scripts/record_release_candidate.py \
+            --artifact "$artifact" \
+            --output "${RUNNER_TEMP}/unsafe-candidate.json" \
+            --mcu esp32s2 \
+            --features mcu-esp32s2,ctaphid-bringup,fido-stack,firmware-diagnostics \
+            --security-profile wemos-s2-mini-development
+          then
+            echo "unsafe release feature set unexpectedly accepted" >&2
+            exit 1
+          fi
+          if python3 scripts/record_release_candidate.py \
+            --artifact "$artifact" \
+            --output "${RUNNER_TEMP}/blocked-candidate.json" \
+            --mcu esp32s2 \
+            --features mcu-esp32s2,ctaphid-bringup,fido-stack \
+            --security-profile wemos-s2-mini-protected-prototype
+          then
+            echo "blocked security profile unexpectedly accepted" >&2
+            exit 1
+          fi
+
+  secure-boot-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned Espressif image tooling
+        run: |
+          python3 -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements-build.txt
+          python3 -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r requirements-dev.txt
+      - name: Test public-key-only Secure Boot V2 verification
+        run: |
+          umask 077
+          unsigned="${RUNNER_TEMP}/unsigned.bin"
+          private_key="${RUNNER_TEMP}/ci-only-private.pem"
+          public_key="${RUNNER_TEMP}/ci-only-public.pem"
+          signed="${RUNNER_TEMP}/signed.bin"
+          printf 'RissoKey CI-only signing fixture\n' > "$unsigned"
+          truncate -s 4096 "$unsigned"
+          python3 -m espsecure generate-signing-key --version 2 "$private_key"
+          openssl pkey -in "$private_key" -pubout -out "$public_key"
+          python3 -m espsecure sign-data --version 2 \
+            --keyfile "$private_key" --output "$signed" "$unsigned"
+          rm "$private_key"
+          python3 tools/verify-secure-boot-v2-signature.py \
+            --image "$signed" \
+            --public-key "$public_key" \
+            --output "${RUNNER_TEMP}/signature-evidence.json"
+          test -s "${RUNNER_TEMP}/signature-evidence.json"
+          cp "$signed" "${RUNNER_TEMP}/tampered.bin"
+          printf X | dd of="${RUNNER_TEMP}/tampered.bin" bs=1 seek=0 conv=notrunc status=none
+          if python3 tools/verify-secure-boot-v2-signature.py \
+            --image "${RUNNER_TEMP}/tampered.bin" \
+            --public-key "$public_key" \
+            --output "${RUNNER_TEMP}/tampered-evidence.json"
+          then
+            echo "tampered image unexpectedly verified" >&2
+            exit 1
+          fi
+
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned host Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.97.0"
+          components: rustfmt
+      - name: Check formatting
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.0"
+        run: cargo fmt --all -- --check
+      - name: Validate locked dependency graph
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.0"
+        run: cargo metadata --locked --format-version 1 > "${RUNNER_TEMP}/cargo-metadata.json"
+      - name: Run pure host unit tests
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/host-unit-target
+          RUSTUP_TOOLCHAIN: "1.97.0"
+        run: |
+          host_target=$(rustc -vV | sed -n 's/^host: //p')
+          cargo test --lib --locked --target "$host_target" \
+            --no-default-features
+      - name: Run persistent-storage fault tests
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.0"
+          TMPDIR: ${{ runner.temp }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/storage-fault-target
+        run: ./tools/test-storage-faults
+      - name: Run authenticator persistent-state tests
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.0"
+          TMPDIR: ${{ runner.temp }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/persistent-state-target
+        run: ./tools/test-persistent-state
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.97.0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned host Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.97.0"
+      - name: Install cargo-audit
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-audit-target
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Check RustSec advisories
+        run: cargo audit --file Cargo.lock
+
+  exported-tree:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.97.0"
+          components: rustfmt
+      - name: Export the clean checked-out source
+        run: python3 scripts/export_public.py "$RUNNER_TEMP/public-export"
+      - name: Validate and test the actual export
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.0"
+          TMPDIR: ${{ runner.temp }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/export-host-target
+        run: |
+          cd "$RUNNER_TEMP/public-export"
+          python3 -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements-build.txt
+          python3 -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r requirements-dev.txt
+          python3 scripts/check_public_tree.py export .
+          python3 -m unittest discover -s tests -p 'test_*.py'
+          cargo fmt --all -- --check
+          host_target=$(rustc -vV | sed -n 's/^host: //p')
+          cargo test --lib --locked --target "$host_target" --no-default-features
+          ./tools/test-storage-faults
+          ./tools/test-persistent-state
+
+  firmware-builds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.97.0"
+      - name: Install pinned Espressif toolchain
+        env:
+          RUSTUP_TOOLCHAIN: "1.97.0"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/espup-build
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo install espup --locked --version 0.17.1 --root "$RUNNER_TEMP/espup"
+          "$RUNNER_TEMP/espup/bin/espup" install --targets esp32s2,esp32s3 \
+            --toolchain-version 1.97.0.0 --name esp-1.97.0.0 \
+            --export-file "$RUNNER_TEMP/export-esp.sh"
+      - name: Build and Clippy-check all public firmware fixtures
+        env:
+          RUSTUP_TOOLCHAIN: esp-1.97.0.0
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          python3 -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements-build.txt
+          python3 -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r requirements-dev.txt
+          python3 scripts/export_public.py "$RUNNER_TEMP/public-export"
+          source "$RUNNER_TEMP/export-esp.sh"
+          cd "$RUNNER_TEMP/public-export"
+          python3 tools/check-firmware-builds.py --check all --build-dir "$RUNNER_TEMP/firmware-builds"
+      - name: Preserve commit-bound build and Clippy evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: firmware-validation-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/firmware-builds/build-results.json
+            ${{ runner.temp }}/public-export/source-export.json
+          if-no-files-found: error
+          retention-days: 90
+
+  macos-helper:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Test exported helper using disposable fixtures
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          python3 -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements-build.txt
+          python3 -m pip install --disable-pip-version-check --require-hashes --no-build-isolation -r requirements-dev.txt
+          python3 scripts/export_public.py "$RUNNER_TEMP/public-export"
+          cd "$RUNNER_TEMP/public-export"
+          python3 tools/macos-key-helper/test-crypto.py

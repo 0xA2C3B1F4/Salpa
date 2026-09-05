@@ -1,0 +1,59 @@
+{
+  "accepted_on": "2026-09-04",
+  "device": {
+    "flash_size_bytes": 4194304,
+    "target": "esp32s2"
+  },
+  "development_trust_anchor_only": true,
+  "efuse_operations_performed": false,
+  "final_state": {
+    "active_slot": 0,
+    "ota_0": {
+      "sequence": 1,
+      "state": "valid"
+    },
+    "ota_1": {
+      "sequence": null,
+      "state": "undefined"
+    }
+  },
+  "gates": {
+    "boot_button_did_not_approve_pending_make_credential": true,
+    "cancellation_channel_recovered": true,
+    "credential_persisted_across_reset": true,
+    "fresh_press_required_for_each_operation": true,
+    "get_assertion_signature_verified": true,
+    "gpio16_held_during_reset_booted_application": true,
+    "gpio16_make_credential_succeeded": true,
+    "led_idle_after": [
+      "success",
+      "cancellation",
+      "user_action_timeout"
+    ],
+    "post_readback_reconnect_get_info": true,
+    "security_fields_identical_before_and_after": true,
+    "transport_checks": [
+      "ctaphid_init",
+      "fragmented_80_byte_ping",
+      "authenticator_get_info"
+    ],
+    "user_action_timeout_without_gpio16": true
+  },
+  "kind": "rissokey-non-strapping-user-presence-physical-acceptance",
+  "package_manifest_sha256": "2909c857a59b2f4ba7c9bc2c62db250e0a8bf10ad810e480bd0cbb830e7d1bfd",
+  "raw_evidence_sha256": {
+    "gpio16-post/security-preflight.json": "da64856e12b78baa32652011693e6e6c944b5e4518c249fcda86503a7b7efbca",
+    "gpio16-post/status.json": "3cfbae23c1f83776e221b97434cd3581861b645bab1089559ebb61bd19963f38",
+    "install/installed.json": "2c85959a8020f0334f5dcec2f7babf1e712a925f3af247f8a1e9b955c73d4b37",
+    "install/security-preflight.json": "da64856e12b78baa32652011693e6e6c944b5e4518c249fcda86503a7b7efbca"
+  },
+  "schema": 1,
+  "security_state": {
+    "dis_download_mode": false,
+    "dis_usb_download_mode": false,
+    "enable_security_download": false,
+    "flash_encryption": "disabled",
+    "secure_boot": false
+  },
+  "source_commit": "3001ce964946dae9a9bd86297ddab15277cdae78"
+}

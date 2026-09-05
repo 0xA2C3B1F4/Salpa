@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "kind": "protected-development-attestation-import",
+  "prepared_at": "2026-09-05T07:11:27.921123+00:00",
+  "importer_source_commit": "66818bf",
+  "owner_authorized_new_identity_for_second_device": true,
+  "firmware_signing_key_changed": false,
+  "flash_key_changed": false,
+  "efuse_operations_performed": false,
+  "host_tests": {
+    "rust_unit_passed": 76,
+    "storage_fault_passed": 11,
+    "python_passed": 22,
+    "helper_crypto_reference_and_negative_tests_passed": true,
+    "normal_firmware_rejects_import_feature": true,
+    "normal_firmware_build_passed": true,
+    "importer_build_passed": true,
+    "private_scalar_not_in_importer_elf": true
+  },
+  "key_storage": {
+    "local_keychain_account": "attestation-v2",
+    "synchronizable": false,
+    "noninteractive_retrieval_denied": true,
+    "backup_created": true,
+    "separate_process_restore_test_passed": true,
+    "offline_medium_restore_included_in_this_test": false
+  },
+  "installation": {
+    "identity_matches": true,
+    "importer_ciphertext_readback_matches": true,
+    "importer_bytes": 282624,
+    "staging_ciphertext_readback_matches": true,
+    "staging_offset": 2097152,
+    "staging_bytes": 4096,
+    "fido_store_preserved": true,
+    "otadata_preserved": true,
+    "reset_performed": false,
+    "efuse_operations_performed": false
+  },
+  "physical_identity_import": {
+    "owner_success_pulses": 2,
+    "identity_matches": true,
+    "all_efuses_unchanged": true,
+    "fido_store_changed_from_erased": true,
+    "staging_sector_erased": true,
+    "otadata_erased": true,
+    "normal_fido_gate_pending": false
+  },
+  "normal_fido_acceptance": {
+    "usb_hid_init_ping_getinfo_passed": true,
+    "expected_packed_attestation_certificate_and_signature_verified": true,
+    "test_credential_creation_passed": true,
+    "test_credential_assertion_passed": true,
+    "power_cycle_persistence": "passed",
+    "power_cycle_assertion_signature_verified": true
+  },
+  "new_mac_recovery_command_implemented_and_fixture_tested": true,
+  "backup_recovery_cli_source_commit": "c7dddcb",
+  "expected_packed_attestation_probe_source_commit": "bab5fa0",
+  "normal_runtime_restoration": {
+    "identity_matches": true,
+    "runtime_ciphertext_readback_matches": true,
+    "runtime_bytes": 413696,
+    "staging_sector_remains_erased": true,
+    "staging_offset": 2097152,
+    "staging_bytes": 4096,
+    "fido_store_preserved": true,
+    "otadata_preserved": true,
+    "reset_performed": false,
+    "efuse_operations_performed": false
+  }
+}

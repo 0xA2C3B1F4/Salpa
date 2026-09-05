@@ -1,0 +1,17 @@
+# Copyright (C) 2023 Nitrokey GmbH
+# SPDX-License-Identifier: CC0-1.0
+
+[package]
+name = "ref-swap"
+version = "0.1.2"
+edition = "2021"
+authors = ["Nitrokey GmbH <info@nitrokey.com>"]
+description = "Safe wrapper around AtomicPtr"
+categories = ["encoding", "no-std"]
+keywords = ["atomic", "references", "no-std", "arc-swap"]
+repository = "https://github.com/nitrokey/ref-swap"
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+
+[dependencies]
+portable-atomic = { version = "1", default-features = false, features = ["require-cas"] }

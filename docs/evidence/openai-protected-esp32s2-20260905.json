@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "kind": "protected-esp32s2-openai-owner-report",
+  "reported_on": "2026-09-05",
+  "runtime_source_commit": "ef2001b",
+  "profile": "wemos-s2-mini-protected-prototype",
+  "device_scope": "second protected ESP32-S2 test device",
+  "evidence_method": "owner report during browser acceptance, without packet capture",
+  "chrome_enrollment_reported": true,
+  "safari_subsequent_authentication_reported": true,
+  "login_began_with_email_address": true,
+  "security_key_pin_requested": true,
+  "physical_button_confirmation_requested": true,
+  "raw_ctap_or_webauthn_trace_captured": false,
+  "browser_versions_recorded": false,
+  "openai_authentication_after_usb_power_cycle_recorded": false,
+  "advanced_account_security_activation_confirmed": false,
+  "existing_account_methods_preserved_by_agent": true,
+  "account_identifiers_or_credential_material_included": false,
+  "certification_or_endorsement_implied": false
+}

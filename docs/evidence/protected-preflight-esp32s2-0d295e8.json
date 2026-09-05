@@ -1,0 +1,76 @@
+{
+  "accepted_on": "2026-09-05",
+  "application_builds": {
+    "normal_secure_version": 3,
+    "normal_usb_image_bytes": 413696,
+    "rollback_failure_secure_version": 3,
+    "rollback_failure_usb_image_bytes": 413696,
+    "usb_identity_reused_without_recording_values": true
+  },
+  "authorization": {
+    "first_efuse_stage": "completed in preceding task; confirmed by fresh readback",
+    "new_package_installation": "pending",
+    "rom_lockdown": "pending separate authorization after physical acceptance",
+    "secure_boot_v2_stage": "pending explicit authorization"
+  },
+  "gates": {
+    "ciphertext_decrypted_at_final_offsets": true,
+    "manifest_file_hashes_verified": 15,
+    "rollback_fixture_excluded_from_install_and_recovery": true,
+    "rollback_usb_matches_both_encrypted_slots": true,
+    "runtime_usb_matches_both_encrypted_slots": true,
+    "same_trusted_root_and_flash_key_as_prior_package": true,
+    "saved_prior_readback_matches_prior_package": true,
+    "signatures_verified": true
+  },
+  "initial_ciphertext_comparison_to_saved_prior_package": {
+    "bootloader": {
+      "ciphertext_identical": false,
+      "signed_plaintext_identical": false
+    },
+    "partition_table": {
+      "ciphertext_identical": true,
+      "signed_plaintext_identical": true
+    },
+    "storage-provisioner_ota_0": {
+      "ciphertext_identical": false,
+      "signed_plaintext_identical": false
+    }
+  },
+  "kind": "rissokey-protected-esp32s2-preflight",
+  "live_read_only_gates": {
+    "all_efuse_values_and_protections_match_saved_first_stage": true,
+    "flash_encryption_enabled": true,
+    "identity_matches_authorized_device": true,
+    "secure_boot_enabled": false,
+    "secure_download_mode_enabled": false
+  },
+  "operations_performed_this_run": {
+    "device_read_only": true,
+    "device_reset": false,
+    "efuse": false,
+    "flash": false,
+    "host_build": true,
+    "sign_and_encrypt_package": true
+  },
+  "package_manifest_sha256": "f406097fd515aad0899d07c0a6a280715ed142871946b3e9b46fef4d38874f11",
+  "raw_evidence_sha256": {
+    "chip-id.txt": "bf968f095ed387c67d8acfd8cf48283d43dd0e338e67657114e9daafe6846496",
+    "efuse-summary.json": "a4be8dee35288d75669bfeacf2b15eeb5f3229dd59c575e865dbe819ed9f2b09",
+    "efuse-summary.log": "391ea1049453c6568b5bcca0baffec045be369c35599847d4ef566e69c04ee01",
+    "security-info.txt": "1b2a0a88ef724ea42de5bfa48bb07a5b9fd7e9bad91c303d45165b92dd4ebfeb"
+  },
+  "remaining_gates": [
+    "install and read back the replacement initial ciphertext regions without reset",
+    "program the matching public signing digest and Secure Boot V2 only after explicit authorization",
+    "prove encrypted boot, fresh-store provisioning, corrected runtime, A/B success and rollback, recovery, and credential persistence",
+    "capture final full eFuse evidence before separately authorized ROM lockdown"
+  ],
+  "schema": 1,
+  "source": {
+    "commit": "0d295e83e818883c0a73392b6c03fbcfdc0e1efe",
+    "efuse_plan_sha256": "93b6945e0e4518aa153b9daf53f0920477d3b7411a55817fd21222a98c84f4d2",
+    "tree": "c5f34ca00f9e323e4310f47912b74225c4b932ff"
+  },
+  "supersedes_host_package_source": "fe17f88956fe6d8497550223eced2ca5ad4ba085"
+}

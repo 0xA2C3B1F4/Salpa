@@ -1,0 +1,13 @@
+[target.xtensa-esp32s2-none-elf]
+runner = "espflash flash --monitor --chip esp32s2 --partition-table partitions.csv"
+rustflags = ["-C", "link-arg=-nostartfiles"]
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor --chip esp32s3 --partition-table partitions.csv"
+rustflags = ["-C", "link-arg=-nostartfiles"]
+
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[unstable]
+build-std = ["core"]

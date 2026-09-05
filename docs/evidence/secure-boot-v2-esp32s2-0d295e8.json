@@ -1,0 +1,114 @@
+{
+  "authorization": {
+    "replacement_initial_ciphertext_installation": true,
+    "rom_lockdown": false,
+    "secure_boot_v2_stage": true
+  },
+  "completed_at": "2026-09-05T04:17:31.158852+00:00",
+  "efuse_readback": {
+    "aggressive_revocation": false,
+    "flash_encryption_counter": "0x7",
+    "profile": "provisioned_before_rom_lockdown",
+    "profile_match": true,
+    "profile_name_describes_efuses_only": true,
+    "rd_dis_raw": "0x01",
+    "rd_dis_write_protected": true,
+    "secure_boot_enabled": true,
+    "secure_rom_download_enabled": false,
+    "signing_digest_block": "BLOCK_KEY1",
+    "signing_digest_matches_package": true,
+    "signing_digest_purpose": "SECURE_BOOT_DIGEST0",
+    "signing_digest_readable": true,
+    "signing_digest_write_protected": true,
+    "slot_0_revoked": false,
+    "slots_1_and_2_revoked": true
+  },
+  "flash_verification": {
+    "completed_before_secure_boot_enable": true,
+    "exact_match": true,
+    "regions": {
+      "bootloader": {
+        "exact_match": true,
+        "offset": 4096,
+        "readback_sha256": "55be69fb6190545f4233871fe16ff98d2d69cd867970b9cec2c49ae6936c17a5",
+        "verified_sector_bytes": 49152
+      },
+      "partition_table": {
+        "exact_match": true,
+        "offset": 57344,
+        "readback_sha256": "b81bf2f6c69fec9020cf1caf732853749f417c7ad65b2b62215c96ee5640270b",
+        "verified_sector_bytes": 4096
+      },
+      "storage-provisioner_ota_0": {
+        "exact_match": true,
+        "offset": 131072,
+        "readback_sha256": "e563487f39323345de54bb3050bd69643981e80e9ca8b0c47fa8ac31eca8d86f",
+        "verified_sector_bytes": 110592
+      }
+    },
+    "scope": "all sectors written by the replacement initial install set, not whole flash",
+    "total_verified_bytes": 163840
+  },
+  "independent_rom_security_info": {
+    "flash_encryption_enabled": true,
+    "secure_boot_enabled": true
+  },
+  "kind": "rissokey-esp32s2-secure-boot-v2-stage",
+  "operations_performed": {
+    "credential_store_provisioning": false,
+    "device_reset": false,
+    "flash_initial_install_set": true,
+    "rd_dis_write_protected": true,
+    "rom_lockdown": false,
+    "runtime_after_provisioning_install": false,
+    "secure_boot_digest_burn": true,
+    "secure_boot_enable": true,
+    "unused_digest_slots_revoked": true
+  },
+  "package_manifest_sha256": "f406097fd515aad0899d07c0a6a280715ed142871946b3e9b46fef4d38874f11",
+  "raw_evidence_sha256": {
+    "after-secure-boot-enable.json": "c7b71498a74725861c2e0d293a57a7c68e3495b5d58883c1741cbf1e9c22659f",
+    "after-secure-boot-enable.log": "0bf7c1d1e6df28611244675861854e4aea5057b0a7a733fd4f1a57b0c07022f3",
+    "after-secure-boot-key.json": "e64358fb0fae539b12e25e4da38146bdb7f06058bfa96ef33ed445869ec88863",
+    "after-secure-boot-key.log": "fbb7a0e4a21ddf903c3d2683dfddc13eba5dae6a300772c81e978cff599b8c5e",
+    "after-secure-boot-stage.json": "a5b87d616f8b394a09dd010617e4722ac988ff33406d84c305f58a817957bc6a",
+    "after-secure-boot-stage.log": "675332b36d1f5a6ac755fa49ce7ac9c1bdd241822cb8b5444368c5a0b7781a73",
+    "before-rd-dis-protect.json": "c7b71498a74725861c2e0d293a57a7c68e3495b5d58883c1741cbf1e9c22659f",
+    "before-rd-dis-protect.log": "ffe93200decd74f8744ae8f0ca5061887380a11357fb54a9f53dd652101b9380",
+    "before-secure-boot-enable.json": "e64358fb0fae539b12e25e4da38146bdb7f06058bfa96ef33ed445869ec88863",
+    "before-secure-boot-enable.log": "9c00502d899f842140f2ddd1f7869481a59e880a1250d23794e0c0bc9fbaf3b0",
+    "before-secure-boot-key.json": "a4be8dee35288d75669bfeacf2b15eeb5f3229dd59c575e865dbe819ed9f2b09",
+    "before-secure-boot-key.log": "9297d3d164772eb881fe7251aa4ca12e4a91982bd0555d73fedc258041f0d356",
+    "bootloader-readback.bin": "55be69fb6190545f4233871fe16ff98d2d69cd867970b9cec2c49ae6936c17a5",
+    "bootloader-readback.log": "292242b71c13ae4d6b275548a633e367c132357beda45629059c45db6747b75d",
+    "burn-secure-boot-fields.log": "fa41227e22225371455ce44d4cecae4c7281d330e8730bf203932f112d1671a6",
+    "burn-secure-boot-key.log": "a8d44553bf576fb624c00d390ad73d2e0024efaae4f91bd4f08b3a3c36371904",
+    "chip-id.txt": "bf968f095ed387c67d8acfd8cf48283d43dd0e338e67657114e9daafe6846496",
+    "ciphertext-install.log": "de59e5d7179099f8b3974a35683cd8129bcf7d68c3e335e4435f8c44b7afcf63",
+    "ciphertext-readback-result.json": "cf30cee8ea6bb4834d56ad86c33b81f84daf8c09f23939d529fb463ecc8d375f",
+    "efuse-summary.json": "a4be8dee35288d75669bfeacf2b15eeb5f3229dd59c575e865dbe819ed9f2b09",
+    "efuse-summary.log": "c3a4f98199ea7b11510442964f94a1aec98e4886ccd138f15abc39f6666d7f3c",
+    "final-efuse-profile-check.log": "4a8b9e740fbb0d95e367170e4a280982d9dc52138b0fa859ec40013f291c9cd9",
+    "partition_table-readback.bin": "b81bf2f6c69fec9020cf1caf732853749f417c7ad65b2b62215c96ee5640270b",
+    "partition_table-readback.log": "48f76de738b45a0066ae19b95f49c2025cf7da8aceb9b52d42ff59fafd8a609a",
+    "security-info-after-stage.txt": "2fce558bd1001ae1126d0ea903e6f67dc26c32983f5f1eec9bf4ffdcdbcc1e76",
+    "security-info.txt": "1b2a0a88ef724ea42de5bfa48bb07a5b9fd7e9bad91c303d45165b92dd4ebfeb",
+    "storage-provisioner_ota_0-readback.bin": "e563487f39323345de54bb3050bd69643981e80e9ca8b0c47fa8ac31eca8d86f",
+    "storage-provisioner_ota_0-readback.log": "5607756124d1f735d5a97cc0f17fa44a7f89c43a62408fa5a9f2c5452a3e343f",
+    "write-protect-rd-dis.log": "bbe55d988c1f8239bd59d1ad6ebfb0d083c2be154970239917fa919e73dff9c5"
+  },
+  "remaining_gates": [
+    "encrypted first boot of the installed storage provisioner",
+    "fresh physical presence for encrypted credential-store provisioning",
+    "install corrected signed runtime after provisioning",
+    "USB FIDO and credential creation",
+    "signed A/B success and rollback, power-cycle persistence, encrypted ROM recovery",
+    "final pre-lockdown readback followed by separately authorized ROM lockdown"
+  ],
+  "schema": 1,
+  "source": {
+    "commit": "0d295e83e818883c0a73392b6c03fbcfdc0e1efe",
+    "efuse_plan_sha256": "93b6945e0e4518aa153b9daf53f0920477d3b7411a55817fd21222a98c84f4d2",
+    "tree": "c5f34ca00f9e323e4310f47912b74225c4b932ff"
+  }
+}

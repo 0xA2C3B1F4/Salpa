@@ -1,0 +1,57 @@
+{
+  "accepted_on": "2026-09-04",
+  "device": {
+    "flash_size_bytes": 4194304,
+    "target": "esp32s2"
+  },
+  "development_trust_anchor_only": true,
+  "efuse_operations_performed": false,
+  "gates": {
+    "activation_last_selected_inactive_slot": "ota_1",
+    "base_fido_get_info_after_power_cut": true,
+    "base_secure_version_after_power_cut": 1,
+    "base_version_after_power_cut": "0.1.0",
+    "complete_usb_transfer_bytes": 413696,
+    "credential_store_preserved_during_rom_install": true,
+    "ctaphid_vendor_protocol": 1,
+    "failure_candidate_first_boot_version": "0.1.1-ab-fail",
+    "failure_candidate_rolled_back_on_next_boot": true,
+    "final_fido_get_info_succeeded": true,
+    "final_secure_version": 2,
+    "final_version": "0.1.2-ab-pass",
+    "fresh_gpio16_press_approved_begin": true,
+    "host_rejected_secure_version_zero_before_presence": true,
+    "inactive_slot_first_erase_bytes": 65536,
+    "malformed_begin_rejected_before_presence": true,
+    "power_cut_left_previous_slot_bootable": true,
+    "post_reconnect_update_phase": "idle",
+    "success_candidate_first_boot_version": "0.1.2-ab-pass",
+    "success_candidate_persisted_after_reconnect": true,
+    "success_image_readback_hash_verified": true,
+    "trusted_signature_accepted": true,
+    "wrong_key_activation_performed": false,
+    "wrong_key_complete_readback_verified": true,
+    "wrong_key_left_active_version_unchanged": true,
+    "wrong_key_rejected_for_signature": true,
+    "valid_begin_timed_out_without_presence": true
+  },
+  "kind": "rissokey-usb-signed-update-development-physical-acceptance",
+  "package_manifest_sha256": "570e1ee487aa825c0806b47e1620bbf2a01120a126ab3e6516d0c02e78086148",
+  "raw_evidence_sha256": {
+    "evidence-install/installed.json": "0393b36a540a66c016def3c38b6e2d05ccc8bdc3bd73db4b92a1e0da5ca79e76",
+    "evidence-install/security-preflight.json": "da64856e12b78baa32652011693e6e6c944b5e4518c249fcda86503a7b7efbca",
+    "evidence-power-cut.json": "ace4e43d005abd026af4a0273f72efe1101cec3f860c9c6997ba434b524a3900"
+  },
+  "remaining_gates": [
+    "encrypted inactive-slot write and readback on protected hardware"
+  ],
+  "schema": 1,
+  "security_state": {
+    "dis_download_mode": false,
+    "dis_usb_download_mode": false,
+    "enable_security_download": false,
+    "flash_encryption": "disabled",
+    "secure_boot": false
+  },
+  "source_commit": "0121171100387e306786488312648e4f3b345420"
+}

@@ -1,0 +1,555 @@
+//! Open source reference implementation of FIDO CTAP.
+//!
+//! The core structure is [`Authenticator`], a Trussed® application.
+//!
+//! It implements the [`ctap_types::ctap1::Authenticator`] and [`ctap_types::ctap2::Authenticator`] traits,
+//! which express the interface defined in the CTAP specification.
+//!
+//! With feature `dispatch` activated, it also implements the `App` traits
+//! of [`apdu_dispatch`] and [`ctaphid_dispatch`].
+//!
+//! [`apdu_dispatch`]: https://docs.rs/apdu-dispatch
+//! [`ctaphid_dispatch`]: https://docs.rs/ctaphid-dispatch
+
+#![cfg_attr(not(test), no_std)]
+// #![warn(missing_docs)]
+
+#[macro_use]
+extern crate delog;
+generate_macros!();
+
+pub use state::migrate;
+
+use core::time::Duration;
+
+use trussed_core::{
+    mechanisms, syscall,
+    types::{
+        KeyId, KeySerialization, Location, Mechanism, SerializedKey, Signature,
+        SignatureSerialization, StorageAttributes,
+    },
+    CertificateClient, CryptoClient, FilesystemClient, ManagementClient, UiClient,
+};
+use trussed_fs_info::{FsInfoClient, FsInfoReply};
+use trussed_hkdf::HkdfClient;
+
+/// Re-export of `ctap-types` authenticator errors.
+pub use ctap_types::Error;
+
+mod ctap1;
+mod ctap2;
+
+#[cfg(feature = "dispatch")]
+mod dispatch;
+
+pub mod constants;
+pub mod credential;
+pub mod state;
+
+pub use ctap2::large_blobs::Config as LargeBlobsConfig;
+
+/// Results with our [`Error`].
+pub type Result<T> = core::result::Result<T, Error>;
+
+/// Trait bound on our implementation's requirements from a Trussed client.
+///
+/// - Client is core Trussed client functionality.
+/// - Ed25519 and P-256 are the core signature algorithms.
+/// - AES-256, SHA-256 and its HMAC are used within the CTAP protocols.
+/// - ChaCha8Poly1305 is our AEAD of choice, used e.g. for the key handles.
+/// - Some Trussed extensions might be required depending on the activated features, see
+///   [`ExtensionRequirements`][].
+pub trait TrussedRequirements:
+    CertificateClient
+    + CryptoClient
+    + FilesystemClient
+    + ManagementClient
+    + UiClient
+    + mechanisms::P256
+    + mechanisms::Chacha8Poly1305
+    + mechanisms::Aes256Cbc
+    + mechanisms::Sha256
+    + mechanisms::HmacSha256
+    + mechanisms::Ed255
+    + MldsaRequirement
+    + FsInfoClient
+    + HkdfClient
+    + ExtensionRequirements
+{
+}
+
+impl<T> TrussedRequirements for T where
+    T: CertificateClient
+        + CryptoClient
+        + FilesystemClient
+        + ManagementClient
+        + UiClient
+        + mechanisms::P256
+        + mechanisms::Chacha8Poly1305
+        + mechanisms::Aes256Cbc
+        + mechanisms::Sha256
+        + mechanisms::HmacSha256
+        + mechanisms::Ed255
+        + MldsaRequirement
+        + FsInfoClient
+        + HkdfClient
+        + ExtensionRequirements
+{
+}
+
+#[cfg(not(feature = "chunked"))]
+pub trait ExtensionRequirements {}
+
+#[cfg(not(feature = "chunked"))]
+impl<T> ExtensionRequirements for T {}
+
+#[cfg(feature = "chunked")]
+pub trait ExtensionRequirements: trussed_chunked::ChunkedClient {}
+
+#[cfg(feature = "chunked")]
+impl<T> ExtensionRequirements for T where T: trussed_chunked::ChunkedClient {}
+
+/// Requires the ML-DSA-44 mechanism when `mldsa44` is on, a no-op otherwise.
+#[cfg(not(feature = "mldsa44"))]
+pub trait MldsaRequirement {}
+
+#[cfg(not(feature = "mldsa44"))]
+impl<T> MldsaRequirement for T {}
+
+#[cfg(feature = "mldsa44")]
+pub trait MldsaRequirement: mechanisms::MlDsa44 {}
+
+#[cfg(feature = "mldsa44")]
+impl<T> MldsaRequirement for T where T: mechanisms::MlDsa44 {}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+/// Externally defined configuration.
+pub struct Config {
+    /// Typically determined by surrounding USB-level decoder.
+    /// For Solo 2, this is usbd-ctaphid (and its buffer size).
+    pub max_msg_size: usize,
+    // pub max_creds_in_list: usize,
+    // pub max_cred_id_length: usize,
+    /// If set, the first Get Assertion or Authenticate request within the specified time after
+    /// boot is accepted without additional user presence verification.
+    pub skip_up_timeout: Option<Duration>,
+    /// The maximum number of resident credentials.
+    pub max_resident_credential_count: Option<u32>,
+    /// Configuration for the largeBlobKey extension and the largeBlobs command.
+    ///
+    /// If this is `None`, the extension and the command are disabled.
+    pub large_blobs: Option<ctap2::large_blobs::Config>,
+    /// Whether the authenticator supports the NFC transport.
+    pub nfc_transport: bool,
+    /// Whether the authenticator exposes FIDO over a CCID smart-card interface
+    /// (CTAP 2.3 §3 FIDO Interfaces). When `true`, GetInfo advertises the
+    /// `"smart-card"` transport alongside `"usb"` / `"nfc"`.
+    pub ccid_transport: bool,
+    /// Firmware version reported by `authenticatorGetInfo` (CTAP 2.1 §6.4 0x0E).
+    ///
+    /// The runner is expected to plumb its own version constant in here.
+    pub firmware_version: Option<FirmwareVersion>,
+    /// The credential ID format to use for new credentials.
+    ///
+    /// To avoid invalidating existing credentials, this value is only used if the state is clean,
+    /// i. e. on the first start or after a reset. Otherwise, `V1` is used.
+    pub credential_id_version: Option<credential::CredentialIdVersion>,
+    /// Whether `authenticatorReset` requires a long touch (a continuous ≥5 s
+    /// press) rather than a normal short touch (CTAP 2.3 §6.6 / §7.7).
+    ///
+    /// Recommended value: `true`. When `true`, reset requires
+    /// [`UserPresence::user_present_strong`] and `authenticatorGetInfo`
+    /// advertises `longTouchForReset = true`. A runner whose button backend
+    /// cannot detect a long press must explicitly opt out by setting this to
+    /// `false`, which restores the normal short-touch presence check. The
+    /// button/hardware backend is untouched either way.
+    pub long_touch_for_reset: bool,
+    /// The timeout for user presence requests in FIDO2/CTAP2 in milliseconds.
+    ///
+    /// The default is [`constants::FIDO2_UP_TIMEOUT`][].  The spec requires at least 10 s.
+    pub fido2_up_timeout: Option<u32>,
+}
+
+impl Config {
+    pub fn new(max_msg_size: usize) -> Self {
+        Self {
+            max_msg_size,
+            skip_up_timeout: None,
+            max_resident_credential_count: None,
+            large_blobs: None,
+            nfc_transport: false,
+            ccid_transport: false,
+            firmware_version: None,
+            credential_id_version: None,
+            long_touch_for_reset: false,
+            fido2_up_timeout: None,
+        }
+    }
+
+    pub fn supports_large_blobs(&self) -> bool {
+        self.large_blobs.is_some()
+    }
+
+    pub fn fido2_up_timeout(&self) -> u32 {
+        self.fido2_up_timeout.unwrap_or(constants::FIDO2_UP_TIMEOUT)
+    }
+}
+
+/// This struct makes it possible to define the firmware version based on the credential ID format
+/// that is currently used by the authenticator.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FirmwareVersion {
+    pub default: usize,
+    pub credential_id_v1: Option<usize>,
+    #[cfg(feature = "credential-id-format-v2")]
+    pub credential_id_v2: Option<usize>,
+}
+
+impl FirmwareVersion {
+    pub fn new(default: usize) -> Self {
+        Self {
+            default,
+            credential_id_v1: None,
+            #[cfg(feature = "credential-id-format-v2")]
+            credential_id_v2: None,
+        }
+    }
+
+    pub fn value(&self, credential_id_version: credential::CredentialIdVersion) -> usize {
+        let value = match credential_id_version {
+            credential::CredentialIdVersion::V1 => self.credential_id_v1,
+            #[cfg(feature = "credential-id-format-v2")]
+            credential::CredentialIdVersion::V2 => self.credential_id_v2,
+        };
+        value.unwrap_or(self.default)
+    }
+}
+
+impl From<usize> for FirmwareVersion {
+    fn from(default: usize) -> Self {
+        Self::new(default)
+    }
+}
+
+// impl Default for Config {
+//     fn default() -> Self {
+//         Self {
+//             max_message_size: ctap_types::sizes::REALISTIC_MAX_MESSAGE_SIZE,
+//             max_credential_count_in_list: ctap_types::sizes::MAX_CREDENTIAL_COUNT_IN_LIST,
+//             max_credential_id_length: ctap_types::sizes::MAX_CREDENTIAL_ID_LENGTH,
+//         }
+//     }
+// }
+
+/// Trussed® app implementing a FIDO authenticator.
+///
+/// It implements the [`ctap_types::ctap1::Authenticator`] and [`ctap_types::ctap2::Authenticator`] traits,
+/// which, in turn, express the interfaces defined in the CTAP specification.
+///
+/// The type parameter `T` selects a Trussed® client implementation, which
+/// must meet the [`TrussedRequirements`] in our implementation.
+///
+/// NB: `T` should be the first parameter, `UP` should default to `Conforming`,
+/// and probably `UP` shouldn't be a generic parameter at all, at least not this kind.
+pub struct Authenticator<UP, T>
+// TODO: changing the order is breaking, but default generic parameters must be trailing.
+// pub struct Authenticator<T, UP=Conforming>
+where
+    UP: UserPresence,
+{
+    trussed: T,
+    state: state::State,
+    up: UP,
+    config: Config,
+}
+
+// EWW.. this is a bit unsafe isn't it
+fn format_hex<'a>(data: &[u8], buffer: &'a mut [u8]) -> &'a str {
+    const HEX_CHARS: &[u8] = b"0123456789abcdef";
+    assert!(data.len() * 2 >= buffer.len());
+    for (idx, byte) in data.iter().enumerate() {
+        buffer[idx * 2] = HEX_CHARS[(byte >> 4) as usize];
+        buffer[idx * 2 + 1] = HEX_CHARS[(byte & 0xf) as usize];
+    }
+
+    // SAFETY: we just added only ascii chars to buffer from 0 to data.len() - 1
+    unsafe { core::str::from_utf8_unchecked(&buffer[0..data.len() * 2]) }
+}
+
+// NB: to actually use this, replace the constant implementation with the inline assembly.
+// Once we move to a new cortex-m release, can use the version from there.
+//
+// use core::arch::asm;
+
+// #[inline]
+// pub fn msp() -> u32 {
+//     let r;
+//     unsafe { asm!("mrs {}, MSP", out(reg) r, options(nomem, nostack, preserves_flags)) };
+//     r
+// }
+
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn msp() -> u32 {
+    0x2000_0000
+}
+
+/// Signing algorithms we know about. COSE alg ids: Ed25519 = -8, P-256 = -7,
+/// ML-DSA-44 = -48 (FIPS 204 / WebAuthn L3, behind the `mldsa44` feature).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(i32)]
+#[non_exhaustive]
+pub enum SigningAlgorithm {
+    /// The Ed25519 signature algorithm.
+    Ed25519 = -8,
+    /// The NIST P-256 signature algorithm.
+    P256 = -7,
+    /// FIPS 204 ML-DSA-44 (NIST level 2 post-quantum signature).
+    #[cfg(feature = "mldsa44")]
+    MlDsa44 = -48,
+}
+
+impl SigningAlgorithm {
+    pub fn mechanism(&self) -> Mechanism {
+        match self {
+            Self::Ed25519 => Mechanism::Ed255,
+            Self::P256 => Mechanism::P256,
+            #[cfg(feature = "mldsa44")]
+            Self::MlDsa44 => Mechanism::MlDsa44,
+        }
+    }
+
+    pub fn signature_serialization(&self) -> SignatureSerialization {
+        match self {
+            Self::Ed25519 => SignatureSerialization::Raw,
+            Self::P256 => SignatureSerialization::Asn1Der,
+            #[cfg(feature = "mldsa44")]
+            Self::MlDsa44 => SignatureSerialization::Raw,
+        }
+    }
+
+    pub fn generate_private_key<C: CryptoClient>(
+        &self,
+        trussed: &mut C,
+        location: Location,
+    ) -> KeyId {
+        syscall!(trussed.generate_key(
+            self.mechanism(),
+            StorageAttributes::new().set_persistence(location)
+        ))
+        .key
+    }
+
+    pub fn derive_public_key<C: CryptoClient>(
+        &self,
+        trussed: &mut C,
+        private_key: KeyId,
+    ) -> SerializedKey {
+        let mechanism = self.mechanism();
+        let public_key = syscall!(trussed.derive_key(
+            mechanism,
+            private_key,
+            None,
+            StorageAttributes::new().set_persistence(Location::Volatile)
+        ))
+        .key;
+        let cose_public_key =
+            syscall!(trussed.serialize_key(mechanism, public_key, KeySerialization::Cose))
+                .serialized_key;
+        if !syscall!(trussed.delete(public_key)).success {
+            error!("failed to delete credential public key");
+        }
+        cose_public_key
+    }
+
+    pub fn sign<C: CryptoClient>(&self, trussed: &mut C, key: KeyId, data: &[u8]) -> Signature {
+        syscall!(trussed.sign(self.mechanism(), key, data, self.signature_serialization()))
+            .signature
+    }
+}
+
+impl From<SigningAlgorithm> for i32 {
+    fn from(alg: SigningAlgorithm) -> Self {
+        match alg {
+            SigningAlgorithm::P256 => -7,
+            SigningAlgorithm::Ed25519 => -8,
+            #[cfg(feature = "mldsa44")]
+            SigningAlgorithm::MlDsa44 => -48,
+        }
+    }
+}
+
+impl TryFrom<i32> for SigningAlgorithm {
+    type Error = Error;
+
+    fn try_from(alg: i32) -> Result<Self> {
+        Ok(match alg {
+            -7 => SigningAlgorithm::P256,
+            -8 => SigningAlgorithm::Ed25519,
+            #[cfg(feature = "mldsa44")]
+            -48 => SigningAlgorithm::MlDsa44,
+            _ => return Err(Error::UnsupportedAlgorithm),
+        })
+    }
+}
+
+/// Method to check for user presence.
+pub trait UserPresence: Copy {
+    fn user_present<T: TrussedRequirements>(
+        self,
+        trussed: &mut T,
+        timeout_milliseconds: u32,
+    ) -> Result<()>;
+
+    /// Strong user-presence check (CTAP 2.3 §7.7 long-touch reset). Default
+    /// falls back to a normal user-presence check; runners that can detect a
+    /// continuous ≥5 s touch should override this and ask trussed for
+    /// `consent::Level::Strong`.
+    fn user_present_strong<T: TrussedRequirements>(
+        self,
+        trussed: &mut T,
+        timeout_milliseconds: u32,
+    ) -> Result<()> {
+        self.user_present(trussed, timeout_milliseconds)
+    }
+}
+
+#[deprecated(note = "use `Silent` directly`")]
+#[doc(hidden)]
+pub type SilentAuthenticator = Silent;
+
+/// No user presence verification.
+#[derive(Copy, Clone)]
+pub struct Silent {}
+
+impl UserPresence for Silent {
+    fn user_present<T: TrussedRequirements>(self, _: &mut T, _: u32) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[deprecated(note = "use `Conforming` directly")]
+#[doc(hidden)]
+pub type NonSilentAuthenticator = Conforming;
+
+/// User presence verification via Trussed.
+#[derive(Copy, Clone)]
+pub struct Conforming {}
+
+impl UserPresence for Conforming {
+    fn user_present<T: TrussedRequirements>(
+        self,
+        trussed: &mut T,
+        timeout_milliseconds: u32,
+    ) -> Result<()> {
+        let result = syscall!(trussed.confirm_user_present(timeout_milliseconds)).result;
+        result.map_err(|err| match err {
+            trussed_core::types::consent::Error::TimedOut => Error::UserActionTimeout,
+            trussed_core::types::consent::Error::Interrupted => Error::KeepaliveCancel,
+            _ => Error::OperationDenied,
+        })
+    }
+
+    fn user_present_strong<T: TrussedRequirements>(
+        self,
+        trussed: &mut T,
+        timeout_milliseconds: u32,
+    ) -> Result<()> {
+        use trussed_core::types::consent::Level;
+        let result =
+            syscall!(trussed.confirm_user_present_with_level(Level::Strong, timeout_milliseconds))
+                .result;
+        result.map_err(|err| match err {
+            trussed_core::types::consent::Error::TimedOut => Error::UserActionTimeout,
+            trussed_core::types::consent::Error::Interrupted => Error::KeepaliveCancel,
+            _ => Error::OperationDenied,
+        })
+    }
+}
+
+impl<UP, T> Authenticator<UP, T>
+where
+    UP: UserPresence,
+    T: TrussedRequirements,
+{
+    pub fn new(trussed: T, up: UP, config: Config) -> Self {
+        let state = state::State::new();
+        Self {
+            trussed,
+            state,
+            up,
+            config,
+        }
+    }
+
+    fn estimate_remaining_inner(info: &FsInfoReply) -> Option<u32> {
+        let block_size = info.block_info.as_ref()?.size;
+        // 1 block for the directory, 1 for the private key, 400 bytes for a reasonnable key and metadata
+        let size_taken = 2 * block_size + 400;
+        // Remove 5 block kept as buffer
+        Some((info.available_space.saturating_sub(5 * block_size) / size_taken) as u32)
+    }
+
+    fn estimate_remaining(&mut self) -> Option<u32> {
+        let info = syscall!(self.trussed.fs_info(Location::Internal));
+        debug!("Got filesystem info: {info:?}");
+        Self::estimate_remaining_inner(&info)
+    }
+
+    fn can_fit_inner(info: &FsInfoReply, size: usize) -> Option<bool> {
+        let block_size = info.block_info.as_ref()?.size;
+        // 1 block for the rp directory, 5 block of margin, 50 bytes for a reasonnable metadata
+        let size_taken = 6 * block_size + size + 50;
+        Some(size_taken < info.available_space)
+    }
+
+    /// Can a credential of size `size` be stored with safe margins
+    ///
+    /// This assumes that the key has already been generated and is stored.
+    fn can_fit(&mut self, size: usize) -> Option<bool> {
+        debug!("Can fit for {size} bytes");
+        let info = syscall!(self.trussed.fs_info(Location::Internal));
+        debug!("Got filesystem info: {info:?}");
+        debug!(
+            "Available storage: {:?}",
+            Self::estimate_remaining_inner(&info)
+        );
+        Self::can_fit_inner(&info, size)
+    }
+
+    fn hash(&mut self, data: &[u8]) -> [u8; 32] {
+        let hash = syscall!(self.trussed.hash_sha256(data)).hash;
+        hash.as_slice().try_into().expect("hash should fit")
+    }
+
+    fn nonce(&mut self) -> [u8; 12] {
+        let bytes = syscall!(self.trussed.random_bytes(12)).bytes;
+        bytes.as_slice().try_into().expect("hash should fit")
+    }
+
+    fn skip_up_check(&mut self) -> bool {
+        // If enabled in the configuration, we don't require an additional user presence
+        // verification for a certain duration after boot.
+        if let Some(timeout) = self.config.skip_up_timeout.take() {
+            let uptime = syscall!(self.trussed.uptime()).uptime;
+            if uptime < timeout {
+                info_now!("skip up check directly after boot");
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn hex() {
+        let data = [0x01, 0x02, 0xB1, 0xA1];
+        let buffer = &mut [0; 8];
+        assert_eq!(format_hex(&data, buffer), "0102b1a1");
+        assert_eq!(buffer, b"0102b1a1");
+    }
+}

@@ -1,0 +1,2691 @@
+//! The `ctap_types::ctap2::Authenticator` implementation.
+
+use credential_management::CredentialManagement;
+use ctap_types::{
+    ctap2::{
+        self,
+        client_pin::Permissions,
+        config::{MAX_MIN_PIN_LENGTH_RP_IDS, MAX_RP_ID_LENGTH},
+        get_assertion::HmacSecretInput,
+        AttestationFormatsPreference, AttestationStatement, AttestationStatementFormat,
+        Authenticator, NoneAttestationStatement, PackedAttestationStatement, VendorOperation,
+    },
+    sizes::{self, MAX_CRED_BLOB_LENGTH},
+    webauthn::{
+        FilteredPublicKeyCredentialParameters, KnownPublicKeyCredentialParameters,
+        PublicKeyCredentialUserEntity,
+    },
+    ByteArray, Error,
+};
+use heapless::{String, Vec};
+use heapless_bytes::Bytes;
+use littlefs2_core::{path, Path, PathBuf};
+use sha2::{Digest as _, Sha256};
+
+use trussed_core::{
+    syscall, try_syscall,
+    types::{KeyId, Location, Mechanism, MediumData, Message, StorageAttributes},
+};
+
+use crate::{
+    constants::MAX_RESIDENT_CREDENTIALS_GUESSTIMATE,
+    credential::{self, Credential, FullCredential, Key, StrippedCredential},
+    format_hex, state, Result, SigningAlgorithm, TrussedRequirements, UserPresence,
+};
+
+#[allow(unused_imports)]
+use crate::msp;
+
+pub mod credential_management;
+pub mod large_blobs;
+pub mod pin;
+
+use pin::{PinProtocol, PinProtocolVersion, RpScope, SharedSecret};
+
+pub const RK_DIR: &Path = path!("rk");
+
+/// Implement `ctap2::Authenticator` for our Authenticator.
+impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenticator<UP, T> {
+    #[inline(never)]
+    fn get_info(&mut self) -> ctap2::get_info::Response {
+        use ctap2::get_info::{Extension, Transport, Version};
+
+        debug_now!("remaining stack size: {} bytes", msp() - 0x2000_0000);
+
+        let mut versions = Vec::new();
+        // CTAP 2.1 §7.2.4: when alwaysUv is enabled the authenticator MUST
+        // disable CTAP1/U2F unless it has a built-in UV method (we don't).
+        // Step 1 of that section says "U2F_V2 MUST NOT appear in versions".
+        // The matching dispatch-level reject (SW_COMMAND_NOT_ALLOWED on
+        // U2F_REGISTER / U2F_AUTHENTICATE) lives in `src/ctap1.rs`.
+        if !self.state.persistent.always_uv() {
+            versions.push(Version::U2fV2).unwrap();
+        }
+        versions.push(Version::Fido2_0).unwrap();
+        versions.push(Version::Fido2_1).unwrap();
+        // CTAP 2.3 §6.4: "The string 'FIDO_2_2' was not defined for CTAP2.2
+        // and MUST not be present in versions member." CTAP 2.2 was an
+        // addendum; 2.2-level features (e.g. hmac-secret-mc) are still
+        // discoverable via the extensions list.
+        versions.push(Version::Fido2_3).unwrap();
+
+        let mut extensions = Vec::new();
+        extensions.push(Extension::CredProtect).unwrap();
+        extensions.push(Extension::CredBlob).unwrap();
+        extensions.push(Extension::HmacSecret).unwrap();
+        extensions.push(Extension::HmacSecretMc).unwrap();
+        if self.config.supports_large_blobs() {
+            extensions.push(Extension::LargeBlobKey).unwrap();
+        }
+        extensions.push(Extension::MinPinLength).unwrap();
+        extensions.push(Extension::ThirdPartyPayment).unwrap();
+
+        let mut pin_protocols = Vec::new();
+        for pin_protocol in self.pin_protocols() {
+            pin_protocols.push(u8::from(*pin_protocol)).unwrap();
+        }
+
+        let mut options = ctap2::get_info::CtapOptions::default();
+        options.rk = true;
+        options.up = true;
+        options.plat = Some(false);
+        options.cred_mgmt = Some(true);
+        options.client_pin = match self.state.persistent.pin_is_set() {
+            true => Some(true),
+            false => Some(false),
+        };
+        options.large_blobs = Some(self.config.supports_large_blobs());
+        options.pin_uv_auth_token = Some(true);
+        // CTAP 2.1 §6.11.2 toggleAlwaysUv: when alwaysUv is enabled, the
+        // authenticator MUST report makeCredUvNotRqd as false. We couple the
+        // two here so the toggle subcommand doesn't have to update two pieces
+        // of state. The authenticator's "default" for makeCredUvNotRqd (when
+        // alwaysUv is disabled) is true — non-discoverable MC without UV is
+        // allowed by this authenticator.
+        options.make_cred_uv_not_rqd = Some(!self.state.persistent.always_uv());
+        options.authnr_cfg = Some(true);
+        options.set_min_pin_length = Some(true);
+        options.always_uv = Some(self.state.persistent.always_uv());
+
+        let mut transports = Vec::new();
+        if self.config.nfc_transport {
+            transports.push(Transport::Nfc).unwrap();
+        }
+        if self.config.ccid_transport {
+            transports.push(Transport::SmartCard).unwrap();
+        }
+        transports.push(Transport::Usb).unwrap();
+
+        let mut attestation_formats = Vec::new();
+        // CTAP 2.1 §6.4: "none" is implied and MUST NOT appear in
+        // `authenticatorGetInfo.attestationFormats`. We still honour it
+        // internally when requested via `attestationFormatsPreference`.
+        attestation_formats
+            .push(AttestationStatementFormat::Packed)
+            .unwrap();
+
+        let (_, aaguid) = self.state.identity.attestation(&mut self.trussed);
+
+        // Not `::ALL`: ctap-types enables mldsa44 for PIV too, we only sign what's here.
+        let mut algorithms = Vec::new();
+        algorithms
+            .push(KnownPublicKeyCredentialParameters::ES256)
+            .unwrap();
+        algorithms
+            .push(KnownPublicKeyCredentialParameters::EdDSA)
+            .unwrap();
+        #[cfg(feature = "mldsa44")]
+        algorithms
+            .push(KnownPublicKeyCredentialParameters::MLDSA44)
+            .unwrap();
+        let algorithms = FilteredPublicKeyCredentialParameters(algorithms);
+
+        let remaining_discoverable_credentials = self.estimate_remaining();
+
+        let mut response = ctap2::get_info::Response::default();
+        response.versions = versions;
+        response.extensions = Some(extensions);
+        response.aaguid = ByteArray::new(aaguid);
+        response.options = Some(options);
+        response.transports = Some(transports);
+        // 1200
+        response.max_msg_size = Some(self.config.max_msg_size);
+        response.pin_protocols = Some(pin_protocols);
+        response.max_creds_in_list = Some(ctap_types::sizes::MAX_CREDENTIAL_COUNT_IN_LIST);
+        response.max_cred_id_length = Some(ctap_types::sizes::MAX_CREDENTIAL_ID_LENGTH);
+        response.algorithms = Some(algorithms);
+        response.firmware_version = self
+            .config
+            .firmware_version
+            .map(|version| version.value(self.state.persistent.credential_id_version()));
+        response.remaining_discoverable_credentials =
+            remaining_discoverable_credentials.map(|count| count as usize);
+        response.max_cred_blob_length = Some(MAX_CRED_BLOB_LENGTH);
+        // CTAP 2.1 §6.4 0x0B: required when largeBlobs is supported.
+        if let Some(cfg) = self.config.large_blobs.as_ref() {
+            response.max_serialized_large_blob_array = Some(cfg.max_size());
+        }
+        response.min_pin_length = Some(self.state.persistent.min_pin_length());
+        response.force_pin_change = Some(self.state.persistent.force_pin_change());
+        response.max_rpids_for_set_min_pin_length = Some(MAX_MIN_PIN_LENGTH_RP_IDS);
+        response.long_touch_for_reset = Some(self.config.long_touch_for_reset);
+        response.attestation_formats = Some(attestation_formats);
+        // CTAP 2.3 §6.4 0x1F: supported authenticatorConfig sub-command IDs.
+        //   0x02 toggleAlwaysUv          (CTAP 2.3 §6.11.2)
+        //   0x03 setMinPINLength         (CTAP 2.3 §6.11.4)
+        //   0x04 enableLongTouchForReset (CTAP 2.3 §6.11.5)
+        let mut cfg_cmds = Vec::new();
+        cfg_cmds
+            .push(ctap2::config::Subcommand::ToggleAlwaysUv)
+            .unwrap();
+        cfg_cmds
+            .push(ctap2::config::Subcommand::SetMinPINLength)
+            .unwrap();
+        if self.config.long_touch_for_reset {
+            cfg_cmds
+                .push(ctap2::config::Subcommand::EnableLongTouchForReset)
+                .unwrap();
+        }
+        response.authenticator_config_commands = Some(cfg_cmds);
+        response
+    }
+
+    #[inline(never)]
+    fn get_next_assertion_into(
+        &mut self,
+        response: &mut ctap2::get_assertion::Response,
+    ) -> Result<()> {
+        // 3. previous GA/GNA >30s ago -> discard stat
+        // this is optional over NFC
+        if false {
+            self.state.runtime.clear_credential_cache();
+            self.state.runtime.active_get_assertion = None;
+            return Err(Error::NotAllowed);
+        }
+        //
+        // 1./2. don't remember / don't have left any credentials
+        // 4. select credential
+        // let data = syscall!(self.trussed.read_file(
+        //     timestamp_hash.location,
+        //     timestamp_hash.path,
+        // )).data;
+        if self.state.runtime.active_get_assertion.is_none() {
+            return Err(Error::NotAllowed);
+        }
+        let credential = self
+            .state
+            .runtime
+            .pop_credential(&mut self.trussed)
+            .ok_or(Error::NotAllowed)?;
+
+        // 5. suppress PII if no UV was performed in original GA
+
+        // 6. sign
+        // 7. reset timer
+        // 8. increment credential counter (not applicable)
+
+        self.assert_with_credential(None, &Credential::Full(credential), response)
+    }
+
+    #[inline(never)]
+    fn make_credential_into(
+        &mut self,
+        parameters: &ctap2::make_credential::Request,
+        response: &mut ctap2::make_credential::Response,
+    ) -> Result<()> {
+        // CTAP 2.1 §6.1.1.2: rp.id must be present and non-empty.
+        if parameters.rp.id.is_empty() {
+            return Err(Error::MissingParameter);
+        }
+        let rp_id_hash = self.hash(parameters.rp.id.as_ref());
+
+        // 1-4.
+        if let Some(options) = parameters.options.as_ref() {
+            // CTAP 2.1 §6.1.2: MakeCredential allows `up` only with value
+            // true (UP is implicit and required); `up=false` is invalid.
+            if options.up == Some(false) {
+                return Err(Error::InvalidOption);
+            }
+        }
+        if parameters.enterprise_attestation.is_some() {
+            return Err(Error::InvalidParameter);
+        }
+        let uv_performed = self.pin_prechecks(
+            &parameters.options,
+            parameters.pin_auth.map(AsRef::as_ref),
+            parameters.pin_protocol,
+            parameters.client_data_hash.as_ref(),
+            Permissions::MAKE_CREDENTIAL,
+            &parameters.rp.id,
+        )?;
+
+        // 5. "persist credProtect value for this credential"
+        // --> seems out of place here, see 9.
+
+        // 6. excludeList present, contains credential ID on this authenticator bound to RP?
+        // --> wait for UP, error CredentialExcluded
+        if let Some(exclude_list) = &parameters.exclude_list {
+            for descriptor in exclude_list.iter() {
+                let result = Credential::try_from(self, &rp_id_hash, descriptor);
+                if let Ok(excluded_cred) = result {
+                    use credential::CredentialProtectionPolicy;
+                    // If UV is not performed, than CredProtectRequired credentials should not be visibile.
+                    if !(excluded_cred.cred_protect() == Some(CredentialProtectionPolicy::Required))
+                        || uv_performed
+                    {
+                        info_now!("Excluded!");
+                        self.up
+                            .user_present(&mut self.trussed, self.config.fido2_up_timeout())?;
+                        return Err(Error::CredentialExcluded);
+                    }
+                }
+            }
+        }
+
+        // 7. check pubKeyCredParams algorithm is valid + supported COSE identifier
+
+        // CTAP §6.1.2: first supported algorithm wins, hence the `is_none` guards.
+        let mut algorithm: Option<SigningAlgorithm> = None;
+        for param in parameters.pub_key_cred_params.0.iter() {
+            if algorithm.is_some() {
+                break;
+            }
+            match param.alg() {
+                -7 =>
+                {
+                    #[allow(clippy::collapsible_match)]
+                    if algorithm.is_none() {
+                        algorithm = Some(SigningAlgorithm::P256);
+                    }
+                }
+                -8 => {
+                    algorithm = Some(SigningAlgorithm::Ed25519);
+                }
+                #[cfg(feature = "mldsa44")]
+                ctap_types::webauthn::ML_DSA_44 => {
+                    if algorithm.is_none() {
+                        algorithm = Some(SigningAlgorithm::MlDsa44);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let algorithm = algorithm.ok_or(Error::UnsupportedAlgorithm)?;
+        info_now!("algo: {:?}", algorithm as i32);
+
+        // 8. process options; on known but unsupported error UnsupportedOption
+
+        let mut rk_requested = false;
+        // TODO: why is this unused?
+        let mut _uv_requested = false;
+        let _up_requested = true; // can't be toggled
+
+        info_now!("MC options: {:?}", &parameters.options);
+        if let Some(ref options) = &parameters.options {
+            if Some(true) == options.rk {
+                rk_requested = true;
+            }
+            if Some(true) == options.uv {
+                _uv_requested = true;
+            }
+        }
+
+        // 9. process extensions
+        let mut hmac_secret_requested = None;
+        // let mut cred_protect_requested = CredentialProtectionPolicy::Optional;
+        let mut cred_protect_requested = None;
+        let mut large_blob_key_requested = false;
+        let mut third_party_payment_requested = false;
+        let mut cred_blob_to_store: Option<Bytes<MAX_CRED_BLOB_LENGTH>> = None;
+        let mut cred_blob_requested = false;
+        // CTAP 2.1 §10.1.2.1 minPinLength extension: return the current
+        // `minPINLength` to RPs the platform has allowlisted via
+        // `authenticatorConfig.setMinPINLength`. When requested but the RP is
+        // out of scope, the spec says "return without the extension output" —
+        // we leave `min_pin_length_to_emit = None` and skip the extension
+        // block entirely (no EXTENSION_DATA flag, no map entry).
+        let mut min_pin_length_to_emit: Option<u8> = None;
+        if let Some(extensions) = &parameters.extensions {
+            hmac_secret_requested = extensions.hmac_secret;
+
+            if let Some(policy) = &extensions.cred_protect {
+                cred_protect_requested =
+                    Some(credential::CredentialProtectionPolicy::try_from(*policy)?);
+            }
+
+            if self.config.supports_large_blobs() {
+                if let Some(large_blob_key) = extensions.large_blob_key {
+                    if large_blob_key {
+                        if !rk_requested {
+                            // the largeBlobKey extension is only available for resident keys
+                            return Err(Error::InvalidOption);
+                        }
+                        large_blob_key_requested = true;
+                    } else {
+                        // large_blob_key must be Some(true) or omitted, Some(false) is invalid
+                        return Err(Error::InvalidOption);
+                    }
+                }
+            }
+
+            third_party_payment_requested = extensions.third_party_payment.unwrap_or_default();
+
+            if let Some(blob) = extensions.cred_blob {
+                cred_blob_requested = true;
+                // Spec (CTAP 2.1 §11.1): authenticator MAY refuse to store. We
+                // refuse when (a) the blob exceeds `MAX_CRED_BLOB_LENGTH`, or
+                // (b) the credential is non-discoverable — encoding `credBlob`
+                // into a non-RK credential ID would push it past
+                // `MAX_CREDENTIAL_ID_LENGTH = 255`. In either case, leave
+                // `cred_blob_to_store = None` and emit `credBlob: false` in the
+                // MC output extensions.
+                if rk_requested && blob.len() <= MAX_CRED_BLOB_LENGTH {
+                    cred_blob_to_store = Some(Bytes::try_from(&**blob).expect("len bounded above"));
+                }
+            }
+
+            if extensions.min_pin_length == Some(true) {
+                let rp_id: &str = parameters.rp.id.as_ref();
+                if self
+                    .state
+                    .persistent
+                    .min_pin_length_rp_ids()
+                    .iter()
+                    .any(|allowed| allowed.as_str() == rp_id)
+                {
+                    min_pin_length_to_emit = Some(self.state.persistent.min_pin_length());
+                }
+            }
+        }
+
+        let hmac_secret_mc_input = parameters
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.hmac_secret_mc.as_ref());
+
+        // CTAP 2.2 §11.4.5: hmac-secret-mc requires hmac-secret=true on the
+        // same request (it evaluates hmac-secret at MakeCredential time).
+        if hmac_secret_mc_input.is_some() && hmac_secret_requested != Some(true) {
+            return Err(Error::MissingParameter);
+        }
+
+        // debug_now!("hmac-secret = {:?}, credProtect = {:?}", hmac_secret_requested, cred_protect_requested);
+
+        // 10. get UP, if denied error OperationDenied
+        self.up
+            .user_present(&mut self.trussed, self.config.fido2_up_timeout())?;
+
+        // 11. generate credential keypair
+        let location = match rk_requested {
+            true => Location::Internal,
+            false => Location::Volatile,
+        };
+        let private_key = algorithm.generate_private_key(&mut self.trussed, location);
+
+        // The credential key now exists in the keystore. Resident keys are
+        // persisted to `Location::Internal`, so every error path from here must
+        // delete the key, otherwise it is orphaned and leaks VFS space. Run the
+        // remainder in a closure so a single cleanup below covers all of its
+        // early returns.
+        let make_credential_result = (|| -> Result<()> {
+            let cose_public_key = algorithm.derive_public_key(&mut self.trussed, private_key);
+
+            // 11.b CTAP 2.2 hmac-secret-mc: evaluate hmac-secret at MakeCredential
+            // time so the platform can capture salts atomically with credential
+            // creation. Same wire format as GA's hmac-secret output.
+            let hmac_secret_mc_output: Option<Bytes<80>> =
+                if let Some(hmac_secret) = hmac_secret_mc_input.as_ref() {
+                    let output = self.process_hmac_secret_extension(
+                        false,
+                        hmac_secret,
+                        private_key,
+                        uv_performed,
+                    )?;
+                    Some(output)
+                } else {
+                    None
+                };
+
+            // 12. if `rk` is set, store or overwrite key pair, if full error KeyStoreFull
+            let credential_id_version = self.state.persistent.credential_id_version();
+
+            // 12.a generate credential
+            let key_parameter = match rk_requested {
+                true => Key::ResidentKey(private_key),
+                false => {
+                    // WrappedKey version
+                    let wrapping_key = self.state.persistent.key_wrapping_key(&mut self.trussed)?;
+                    credential_id_version.wrap_key(&mut self.trussed, wrapping_key, private_key)?
+                }
+            };
+
+            // injecting this is a bit mehhh..
+            let nonce = self.nonce();
+            info_now!("nonce = {:?}", &nonce);
+
+            // 12.b generate credential ID { = AEAD(Serialize(Credential)) }
+            let kek = self
+                .state
+                .persistent
+                .key_encryption_key(&mut self.trussed)?;
+
+            // store it.
+            // TODO: overwrite, error handling with KeyStoreFull
+
+            let large_blob_key = if large_blob_key_requested {
+                let key = syscall!(self.trussed.random_bytes(32)).bytes;
+                Some(ByteArray::new(key.as_slice().try_into().unwrap()))
+            } else {
+                None
+            };
+
+            let credential = FullCredential::new(
+                credential::CtapVersion::Fido21Pre,
+                &parameters.rp,
+                &parameters.user,
+                algorithm as i32,
+                key_parameter,
+                self.state.persistent.signature_counter(&mut self.trussed)?,
+                hmac_secret_requested,
+                cred_protect_requested,
+                large_blob_key,
+                third_party_payment_requested.then_some(true),
+                cred_blob_to_store.clone(),
+                nonce,
+            );
+
+            // note that this does the "stripping" of OptionalUI etc.
+            let credential_id = StrippedCredential::from(&credential).id(
+                &mut self.trussed,
+                credential_id_version,
+                kek,
+                &rp_id_hash,
+            )?;
+
+            if rk_requested {
+                // serialization with all metadata
+                let serialized_credential = credential.serialize()?;
+
+                // first delete any other RK cred with same RP + UserId if there is one.
+                self.delete_resident_key_by_user_id(&rp_id_hash, credential.user.id())
+                    .ok();
+
+                let mut key_store_full = self.can_fit(serialized_credential.len()) == Some(false)
+                    || CredentialManagement::new(self).count_credentials()?
+                        >= self
+                            .config
+                            .max_resident_credential_count
+                            .unwrap_or(MAX_RESIDENT_CREDENTIALS_GUESSTIMATE);
+
+                if !key_store_full {
+                    // then store key, making it resident
+                    let credential_id_hash = self.hash(credential_id.0.as_ref());
+                    let result = try_syscall!(self.trussed.write_file(
+                        Location::Internal,
+                        rk_path(&rp_id_hash, &credential_id_hash),
+                        serialized_credential,
+                        // user attribute for later easy lookup
+                        // Some(rp_id_hash.clone()),
+                        None,
+                    ));
+                    key_store_full = result.is_err();
+                }
+
+                if key_store_full {
+                    return Err(Error::KeyStoreFull);
+                }
+            }
+
+            // 13. generate and return attestation statement using clientDataHash
+
+            // 13.a AuthenticatorData and its serialization
+            use ctap2::AuthenticatorDataFlags as Flags;
+            info_now!("MC created cred id");
+
+            let (attestation_maybe, aaguid) = self.state.identity.attestation(&mut self.trussed);
+
+            let authenticator_data = ctap2::make_credential::AuthenticatorData {
+                rp_id_hash: &rp_id_hash,
+
+                flags: {
+                    let mut flags = Flags::USER_PRESENCE;
+                    if uv_performed {
+                        flags |= Flags::USER_VERIFIED;
+                    }
+                    if true {
+                        flags |= Flags::ATTESTED_CREDENTIAL_DATA;
+                    }
+                    if hmac_secret_requested.is_some()
+                        || cred_protect_requested.is_some()
+                        || cred_blob_requested
+                        || min_pin_length_to_emit.is_some()
+                        || hmac_secret_mc_output.is_some()
+                    {
+                        flags |= Flags::EXTENSION_DATA;
+                    }
+                    flags
+                },
+
+                sign_count: credential.creation_time,
+
+                attested_credential_data: {
+                    // debug_now!("acd in, cid len {}, pk len {}", credential_id.0.len(), cose_public_key.len());
+                    let attested_credential_data = ctap2::make_credential::AttestedCredentialData {
+                        aaguid: &aaguid,
+                        credential_id: &credential_id.0,
+                        credential_public_key: &cose_public_key,
+                    };
+                    // debug_now!("cose PK = {:?}", &attested_credential_data.credential_public_key);
+                    Some(attested_credential_data)
+                },
+
+                extensions: {
+                    if hmac_secret_requested.is_some()
+                        || cred_protect_requested.is_some()
+                        || cred_blob_requested
+                        || min_pin_length_to_emit.is_some()
+                        || hmac_secret_mc_output.is_some()
+                    {
+                        let mut extensions = ctap2::make_credential::ExtensionsOutput::default();
+                        extensions.cred_protect =
+                            parameters.extensions.as_ref().unwrap().cred_protect;
+                        extensions.hmac_secret =
+                            parameters.extensions.as_ref().unwrap().hmac_secret;
+                        if cred_blob_requested {
+                            // `Some(true)` if the platform-supplied blob fit in
+                            // `MAX_CRED_BLOB_LENGTH` and was stored, `Some(false)`
+                            // otherwise (CTAP 2.1 §11.1).
+                            extensions.cred_blob = Some(cred_blob_to_store.is_some());
+                        }
+                        extensions.min_pin_length = min_pin_length_to_emit;
+                        if let Some(out) = hmac_secret_mc_output {
+                            extensions.hmac_secret_mc = Some(out);
+                        }
+                        Some(extensions)
+                    } else {
+                        None
+                    }
+                },
+            };
+            // debug_now!("authData = {:?}", &authenticator_data);
+
+            let mut serialized_auth_data = authenticator_data.serialize()?;
+
+            // select attestation format or use packed attestation as default
+            let att_stmt_fmt = parameters
+                .attestation_formats_preference
+                .as_ref()
+                .map(SupportedAttestationFormat::select)
+                .unwrap_or(Some(SupportedAttestationFormat::Packed));
+            let att_stmt = if let Some(format) = att_stmt_fmt {
+                match format {
+                    SupportedAttestationFormat::None => {
+                        Some(AttestationStatement::None(NoneAttestationStatement {}))
+                    }
+                    SupportedAttestationFormat::Packed => {
+                        // Sign auth_data ‖ cdh in place, then truncate back to auth_data.
+                        let auth_data_len = serialized_auth_data.len();
+                        serialized_auth_data
+                            .extend_from_slice(parameters.client_data_hash)
+                            .map_err(|_| Error::Other)?;
+
+                        let (attestation_key, attestation_algorithm) = attestation_maybe
+                            .as_ref()
+                            .map(|attestation| (attestation.0, SigningAlgorithm::P256))
+                            .unwrap_or((private_key, algorithm));
+                        let signature = attestation_algorithm.sign(
+                            &mut self.trussed,
+                            attestation_key,
+                            &serialized_auth_data,
+                        );
+                        serialized_auth_data.truncate(auth_data_len);
+                        let packed = PackedAttestationStatement {
+                            alg: attestation_algorithm.into(),
+                            sig: Bytes::try_from(&*signature).map_err(|_| Error::Other)?,
+                            x5c: attestation_maybe.as_ref().map(|attestation| {
+                                // See: https://www.w3.org/TR/webauthn-2/#sctn-packed-attestation-cert-requirements
+                                let cert = attestation.1.clone();
+                                let mut x5c = Vec::new();
+                                x5c.push(cert).ok();
+                                x5c
+                            }),
+                        };
+                        Some(AttestationStatement::Packed(packed))
+                    }
+                }
+            } else {
+                None
+            };
+
+            if !rk_requested {
+                let _success = syscall!(self.trussed.delete(private_key)).success;
+                info_now!("deleted private credential key: {}", _success);
+            }
+
+            response.fmt = att_stmt_fmt
+                .map(From::from)
+                .unwrap_or(AttestationStatementFormat::None);
+            response.auth_data = serialized_auth_data;
+            response.att_stmt = att_stmt;
+            response.large_blob_key = large_blob_key;
+            Ok(())
+        })();
+
+        // On success the credential was fully created (and any non-resident key
+        // was already deleted above). On any error, delete the now-orphaned key
+        // so it does not leak storage.
+        if make_credential_result.is_err() {
+            syscall!(self.trussed.delete(private_key));
+        }
+        make_credential_result
+    }
+
+    #[inline(never)]
+    fn reset(&mut self) -> Result<()> {
+        // 1. >10s after bootup -> NotAllowed
+        let uptime = syscall!(self.trussed.uptime()).uptime;
+        debug_now!("uptime: {:?}", uptime);
+        if uptime.as_secs() > 10 {
+            #[cfg(not(feature = "disable-reset-time-window"))]
+            return Err(Error::NotAllowed);
+        }
+        // 2. check for user presence (denied -> OperationDenied, timeout ->
+        //    UserActionTimeout). Short touch by default (pre-2.3 behavior);
+        //    when `long_touch_for_reset` is enabled we require a continuous
+        //    ≥5 s "long touch" (CTAP 2.3 §6.6 / §7.7) via `Level::Strong`.
+        //    The button/hardware backend is untouched.
+        if self.config.long_touch_for_reset {
+            self.up
+                .user_present_strong(&mut self.trussed, self.config.fido2_up_timeout())?;
+        } else {
+            self.up
+                .user_present(&mut self.trussed, self.config.fido2_up_timeout())?;
+        }
+
+        // Delete resident keys
+        syscall!(self.trussed.delete_all(Location::Internal));
+        syscall!(self
+            .trussed
+            .remove_dir_all(Location::Internal, RK_DIR.into()));
+
+        // Delete large-blob array
+        large_blobs::reset(&mut self.trussed);
+
+        // b. delete persistent state
+        self.state
+            .persistent
+            .reset(&mut self.trussed, &self.config)?;
+
+        // c. Reset runtime state
+        self.state.runtime.reset(&mut self.trussed);
+
+        Ok(())
+    }
+
+    fn selection(&mut self) -> Result<()> {
+        self.up
+            .user_present(&mut self.trussed, self.config.fido2_up_timeout())
+    }
+
+    // https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#authenticatorConfig
+    #[inline(never)]
+    fn config(&mut self, request: &ctap2::config::Request<'_>) -> Result<()> {
+        use ctap2::config::Subcommand;
+
+        // CTAP 2.1 §6.11 — authenticatorConfig algorithm.
+
+        // 1. If subCommand is not present in the input map, return
+        // CTAP2_ERR_MISSING_PARAMETER.
+        // (ctap-types' DeserializeIndexed enforces presence at the wire
+        // layer — `sub_command` is non-optional on `Request`, so absence
+        // surfaces as `SerdeMissingField` → `MissingParameter` before
+        // we get here.)
+
+        // 2. If the authenticator does not support the subcommand being
+        // invoked, per subCommand's value, return CTAP1_ERR_INVALID_PARAMETER.
+        // EnterpriseAttestation / VendorPrototype are not supported.
+        match request.sub_command {
+            Subcommand::SetMinPINLength | Subcommand::ToggleAlwaysUv => {}
+            Subcommand::EnableLongTouchForReset if self.config.long_touch_for_reset => {}
+            _ => return Err(Error::InvalidParameter),
+        }
+
+        // 3. If the following statements are all true:
+        //      - subCommand value is toggleAlwaysUv (0x02).
+        //      - The authenticator is not protected by some form of user verification.
+        //      - The alwaysUv option ID is present and true.
+        //    then go to Step 5.
+        //    Note: This allows for initial configuration of authenticators
+        //    that have the Always UV feature enabled by default.
+        // We have no built-in UV, so "protected by some form of UV"
+        // reduces to clientPin being set. This bypass is the platform's
+        // exit hatch when alwaysUv was pre-flashed and no PIN has been
+        // configured yet — it lets the user clear alwaysUv without
+        // first being forced through PIN setup.
+        let toggle_always_uv_bypass = matches!(request.sub_command, Subcommand::ToggleAlwaysUv)
+            && !self.state.persistent.pin_is_set()
+            && self.state.persistent.always_uv();
+
+        // 4. If the authenticator is protected by some form of user
+        // verification or the alwaysUv option ID is present and true:
+        // We have no built-in UV, so "protected by some form of UV"
+        // reduces to clientPin being set. In factory-default state
+        // (no PIN, alwaysUv off) the block is skipped per the note
+        // after step 6: "authenticatorConfig can be invoked without user
+        // verification if user verification is not configured, and the
+        // Always UV feature is disabled."
+        if !toggle_always_uv_bypass
+            && (self.state.persistent.pin_is_set() || self.state.persistent.always_uv())
+        {
+            // 4.1. If pinUvAuthParam is absent from the input map, then
+            //      end the operation by returning CTAP2_ERR_PUAT_REQUIRED.
+            let pin_auth = request.pin_auth.ok_or(Error::PinRequired)?;
+
+            // 4.2. If pinUvAuthProtocol is absent from the input map,
+            //      then end the operation by returning
+            //      CTAP2_ERR_MISSING_PARAMETER.
+            let pin_protocol = request.pin_protocol.ok_or(Error::MissingParameter)?;
+
+            // 4.3. If pinUvAuthProtocol is not supported, return
+            //      CTAP1_ERR_INVALID_PARAMETER.
+            let pin_protocol = self.parse_pin_protocol(pin_protocol)?;
+
+            // 4.4. Call verify(pinUvAuthToken,
+            //      32×0xff || 0x0d || uint8(subCommand) || subCommandParams,
+            //      pinUvAuthParam).
+            //      If the verification fails, return CTAP2_ERR_PIN_AUTH_INVALID.
+            // Buffer sizing: 32 bytes of 0xff padding + 1 byte cmd (0x0d)
+            // + 1 byte subCommand + worst-case CBOR of SubcommandParameters
+            // (`MAX_SUBCOMMAND_PARAMS_CBOR_LEN`, ctap-types). Oversized
+            // params surface as `InvalidLength` (CTAP1 0x03).
+            let mut data: Bytes<{ 32 + 2 + ctap2::config::MAX_SUBCOMMAND_PARAMS_CBOR_LEN }> =
+                Bytes::new();
+            data.resize(32, 0xff).map_err(|_| Error::Other)?;
+            data.push(0x0d).map_err(|_| Error::Other)?;
+            data.push(request.sub_command as u8)
+                .map_err(|_| Error::Other)?;
+            if let Some(params) = request.sub_command_params.as_ref() {
+                cbor_smol::cbor_serialize_to(params, &mut data)
+                    .map_err(|_| Error::InvalidLength)?;
+            }
+            let mut pin_protocol_impl = self.pin_protocol(pin_protocol);
+            let pin_token = pin_protocol_impl.verify_pin_token(&data, pin_auth)?;
+
+            // 4.5. Check whether the pinUvAuthToken has the acfg
+            //      permission. If not, return CTAP2_ERR_PIN_AUTH_INVALID.
+            pin_token.require_permissions(Permissions::AUTHENTICATOR_CONFIGURATION)?;
+        }
+
+        // 5. Invoke subCommand (see below subsections for each defined
+        //    subcommand), passing it the subCommandParams map.
+        // 6. Return the resulting status code as produced by subCommand,
+        //    as defined in each subcommand subsection below.
+        match request.sub_command {
+            Subcommand::SetMinPINLength => self.config_set_min_pin_length(request),
+            Subcommand::ToggleAlwaysUv => self.state.persistent.toggle_always_uv(&mut self.trussed),
+            // CTAP 2.3 §6.11.5: governed by the `long_touch_for_reset` config
+            // option. Acknowledge when enabled; otherwise it is unavailable.
+            Subcommand::EnableLongTouchForReset => {
+                if self.config.long_touch_for_reset {
+                    Ok(())
+                } else {
+                    Err(Error::InvalidParameter)
+                }
+            }
+            // Step 2 filtered every other variant. `Subcommand` is
+            // `#[non_exhaustive]` so the catch-all is still required.
+            _ => Err(Error::InvalidParameter),
+        }
+    }
+
+    #[inline(never)]
+    fn client_pin(
+        &mut self,
+        parameters: &ctap2::client_pin::Request<'_>,
+    ) -> Result<ctap2::client_pin::Response> {
+        use ctap2::client_pin::PinV1Subcommand as Subcommand;
+        debug_now!("CTAP2.PIN...");
+        // info_now!("{:?}", parameters);
+
+        let pin_protocol = parameters
+            .pin_protocol
+            .ok_or(Error::MissingParameter)
+            .and_then(|pin_protocol| self.parse_pin_protocol(pin_protocol));
+        let mut response = ctap2::client_pin::Response::default();
+
+        match parameters.sub_command {
+            Subcommand::GetRetries => {
+                debug_now!("CTAP2.Pin.GetRetries");
+
+                response.retries = Some(self.state.persistent.retries());
+            }
+
+            Subcommand::GetKeyAgreement => {
+                debug_now!("CTAP2.Pin.GetKeyAgreement");
+
+                let pin_protocol = pin_protocol?;
+                response.key_agreement = Some(self.pin_protocol(pin_protocol).key_agreement_key());
+            }
+
+            Subcommand::SetPin => {
+                debug_now!("CTAP2.Pin.SetPin");
+                // 1. check mandatory parameters
+                let platform_kek = match parameters.key_agreement.as_ref() {
+                    Some(key) => key,
+                    None => {
+                        return Err(Error::MissingParameter);
+                    }
+                };
+                let new_pin_enc = match parameters.new_pin_enc.as_ref() {
+                    Some(pin) => pin,
+                    None => {
+                        return Err(Error::MissingParameter);
+                    }
+                };
+                let pin_auth = match parameters.pin_auth.as_ref() {
+                    Some(auth) => auth,
+                    None => {
+                        return Err(Error::MissingParameter);
+                    }
+                };
+                let pin_protocol = pin_protocol?;
+
+                // 2. is pin already set
+                // CTAP 2.1 §6.5.5.4 step 3: a setPin request against an
+                // already-provisioned authenticator returns PinAuthInvalid.
+                // (Older CTAP 2.0 implementations returned NotAllowed.)
+                if self.state.persistent.pin_is_set() {
+                    return Err(Error::PinAuthInvalid);
+                }
+
+                // 3. generate shared secret
+                let mut pin_protocol = self.pin_protocol(pin_protocol);
+                let shared_secret = pin_protocol.shared_secret(platform_kek)?;
+
+                // TODO: there are moar early returns!!
+                // - implement Drop?
+                // - do garbage collection outside of this?
+
+                // 4. verify pinAuth
+                pin_protocol.verify_pin_auth(&shared_secret, new_pin_enc, pin_auth)?;
+
+                // 5. decrypt and verify new PIN
+                let new_pin = self.decrypt_pin_check_length(&shared_secret, new_pin_enc)?;
+
+                shared_secret.delete(&mut self.trussed);
+
+                // 6. store LEFT(SHA-256(newPin), 16), set retries to 8
+                self.hash_store_pin(&new_pin)?;
+                self.state
+                    .reset_retries(&mut self.trussed)
+                    .map_err(|_| Error::Other)?;
+            }
+
+            Subcommand::ChangePin => {
+                debug_now!("CTAP2.Pin.ChangePin");
+
+                // 1. check mandatory parameters
+                let platform_kek = match parameters.key_agreement.as_ref() {
+                    Some(key) => key,
+                    None => {
+                        return Err(Error::MissingParameter);
+                    }
+                };
+                let pin_hash_enc = match parameters.pin_hash_enc.as_ref() {
+                    Some(hash) => hash,
+                    None => {
+                        return Err(Error::MissingParameter);
+                    }
+                };
+                let new_pin_enc = match parameters.new_pin_enc.as_ref() {
+                    Some(pin) => pin,
+                    None => {
+                        return Err(Error::MissingParameter);
+                    }
+                };
+                let pin_auth = match parameters.pin_auth.as_ref() {
+                    Some(auth) => auth,
+                    None => {
+                        return Err(Error::MissingParameter);
+                    }
+                };
+                let pin_protocol = pin_protocol?;
+
+                // 2. fail if no retries left
+                self.state.pin_blocked()?;
+
+                // 3. generate shared secret
+                let mut pin_protocol_impl = self.pin_protocol(pin_protocol);
+                let shared_secret = pin_protocol_impl.shared_secret(platform_kek)?;
+
+                // 4. verify pinAuth
+                let mut data = MediumData::new();
+                data.extend_from_slice(new_pin_enc)
+                    .map_err(|_| Error::InvalidParameter)?;
+                data.extend_from_slice(pin_hash_enc)
+                    .map_err(|_| Error::InvalidParameter)?;
+                pin_protocol_impl.verify_pin_auth(&shared_secret, &data, pin_auth)?;
+
+                // 5. decrement retries
+                self.state.decrement_retries(&mut self.trussed)?;
+
+                // 6. decrypt pinHashEnc, compare with stored
+                self.decrypt_pin_hash_and_maybe_escalate(
+                    pin_protocol,
+                    &shared_secret,
+                    pin_hash_enc,
+                )?;
+
+                // 7. reset retries
+                self.state.reset_retries(&mut self.trussed)?;
+
+                // 8. decrypt and verify new PIN
+                let new_pin = self.decrypt_pin_check_length(&shared_secret, new_pin_enc)?;
+
+                shared_secret.delete(&mut self.trussed);
+
+                // 8b. CTAP 2.1 §6.5.5.6: "If the forcePINChange member ... is
+                // true and LEFT(SHA-256(newPin), 16) is equal to its internal
+                // stored LEFT(SHA-256(curPin), 16) then authenticator returns
+                // CTAP2_ERR_PIN_POLICY_VIOLATION." We compute the new hash up
+                // front so the comparison is constant-time on a fixed-size
+                // array, and only return the error when force_pin_change is
+                // set — same-PIN change with the flag clear is allowed.
+                let new_pin_hash_32 = syscall!(self.trussed.hash_sha256(&new_pin)).hash;
+                let new_pin_hash: [u8; 16] = new_pin_hash_32[..16].try_into().unwrap();
+                if self.state.persistent.force_pin_change()
+                    && self.state.persistent.pin_hash() == Some(new_pin_hash)
+                {
+                    return Err(Error::PinPolicyViolation);
+                }
+
+                // 9. store hashed PIN + PINCodePointLength
+                // (CTAP 2.1 §6.5.5.5 — "Save the PIN with derived hash
+                // and PINCodePointLength"). `new_pin` was UTF-8-validated
+                // in `decrypt_pin_check_length` above, so the from_utf8
+                // is infallible here; the unwrap_or is defensive.
+                let new_pin_code_point_length = core::str::from_utf8(&new_pin)
+                    .map(|s| s.chars().count())
+                    .unwrap_or(new_pin.len()) as u8;
+                self.state.persistent.set_pin_hash(
+                    &mut self.trussed,
+                    new_pin_hash,
+                    new_pin_code_point_length,
+                )?;
+
+                // CTAP 2.1 §6.5.5.6 step 9: clear forcePINChange after a
+                // successful changePin.
+                self.state
+                    .persistent
+                    .set_force_pin_change(&mut self.trussed, false)?;
+
+                self.pin_protocol(pin_protocol).reset_pin_tokens();
+            }
+
+            // § 6.5.5.7.1 No 4
+            Subcommand::GetPinToken => {
+                debug_now!("CTAP2.Pin.GetPinToken");
+
+                // 1. Check mandatory parameters
+                let key_agreement = parameters
+                    .key_agreement
+                    .as_ref()
+                    .ok_or(Error::MissingParameter)?;
+                let pin_hash_enc = parameters
+                    .pin_hash_enc
+                    .as_ref()
+                    .ok_or(Error::MissingParameter)?;
+
+                // 2. Check PIN protocol
+                let pin_protocol = pin_protocol?;
+
+                // 3. + 4. Check invalid parameters
+                if parameters.permissions.is_some() || parameters.rp_id.is_some() {
+                    return Err(Error::InvalidParameter);
+                }
+
+                // 5. Check PIN retries
+                self.state.pin_blocked()?;
+
+                // 6. Obtain shared secret
+                let shared_secret = self
+                    .pin_protocol(pin_protocol)
+                    .shared_secret(key_agreement)?;
+
+                // 7. Request user consent using display -- skipped
+
+                // 8. Decrement PIN retries
+                self.state.decrement_retries(&mut self.trussed)?;
+
+                // 9. Check PIN
+                self.decrypt_pin_hash_and_maybe_escalate(
+                    pin_protocol,
+                    &shared_secret,
+                    pin_hash_enc,
+                )?;
+
+                // 10. Reset PIN retries
+                self.state.reset_retries(&mut self.trussed)?;
+
+                // 11. CTAP 2.1 §6.5.5.7.1 step 11: while forcePINChange is
+                // set, getPinToken returns PIN_INVALID until a successful
+                // changePin clears the flag.
+                if self.state.persistent.force_pin_change() {
+                    return Err(Error::PinInvalid);
+                }
+
+                // 12. Reset all PIN tokens
+                // 13. Call beginUsingPinUvAuthToken
+                let mut pin_protocol = self.pin_protocol(pin_protocol);
+                let mut pin_token = pin_protocol.reset_and_begin_using_pin_token(false);
+
+                // 14. Assign the default permissions
+                let mut permissions = Permissions::empty();
+                permissions.insert(Permissions::MAKE_CREDENTIAL);
+                permissions.insert(Permissions::GET_ASSERTION);
+                pin_token.restrict(permissions, None);
+
+                // 15. Return PIN token
+                response.pin_token = Some(pin_token.encrypt(&shared_secret)?);
+
+                shared_secret.delete(&mut self.trussed);
+            }
+
+            // § 6.5.5.7.2 No 4
+            Subcommand::GetPinUvAuthTokenUsingPinWithPermissions => {
+                debug_now!("CTAP2.Pin.GetPinUvAuthTokenUsingPinWithPermissions");
+
+                // 1. Check mandatory parameters
+                let key_agreement = parameters
+                    .key_agreement
+                    .as_ref()
+                    .ok_or(Error::MissingParameter)?;
+                let pin_hash_enc = parameters
+                    .pin_hash_enc
+                    .as_ref()
+                    .ok_or(Error::MissingParameter)?;
+                let permissions = parameters.permissions.ok_or(Error::MissingParameter)?;
+
+                // 2. Check PIN protocol
+                let pin_protocol = pin_protocol?;
+
+                // 3. Check that permissions are not empty
+                let permissions = Permissions::from_bits_truncate(permissions);
+                if permissions.is_empty() {
+                    return Err(Error::InvalidParameter);
+                }
+
+                // 4. Check that all requested permissions are supported. We
+                // support `authenticatorConfiguration` (CTAP 2.1 §6.11) — it
+                // was previously listed as unauthorized, which made
+                // `setMinPINLength` impossible to invoke since no platform
+                // could obtain a token with that permission.
+                let mut unauthorized_permissions = Permissions::empty();
+                unauthorized_permissions.insert(Permissions::BIO_ENROLLMENT);
+                if !self.config.supports_large_blobs() {
+                    unauthorized_permissions.insert(Permissions::LARGE_BLOB_WRITE);
+                }
+                if permissions.intersects(unauthorized_permissions) {
+                    return Err(Error::UnauthorizedPermission);
+                }
+
+                // 5. Check PIN retries
+                self.state.pin_blocked()?;
+
+                // 6. Obtain shared secret
+                let shared_secret = self
+                    .pin_protocol(pin_protocol)
+                    .shared_secret(key_agreement)?;
+
+                // 7. Request user consent using display -- skipped
+
+                // 8. Decrement PIN retries
+                self.state.decrement_retries(&mut self.trussed)?;
+
+                // 9. Check PIN
+                self.decrypt_pin_hash_and_maybe_escalate(
+                    pin_protocol,
+                    &shared_secret,
+                    pin_hash_enc,
+                )?;
+
+                // 10. Reset PIN retries
+                self.state.reset_retries(&mut self.trussed)?;
+
+                // 11. CTAP 2.1 §6.5.5.7.3 step 11: while forcePINChange is
+                // set, this variant returns PIN_POLICY_VIOLATION (distinct
+                // from getPinToken's PIN_INVALID; see §6.5.5.7.1).
+                if self.state.persistent.force_pin_change() {
+                    return Err(Error::PinPolicyViolation);
+                }
+
+                // 12. Reset all PIN tokens
+                // 13. Call beginUsingPinUvAuthToken
+                let mut pin_protocol = self.pin_protocol(pin_protocol);
+                let mut pin_token = pin_protocol.reset_and_begin_using_pin_token(false);
+
+                // 14. Assign the requested permissions
+                // 15. Assign the requested RP id
+                let rp_id = parameters
+                    .rp_id
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(|_| Error::InvalidParameter)?;
+                pin_token.restrict(permissions, rp_id);
+
+                // 16. Return PIN token
+                response.pin_token = Some(pin_token.encrypt(&shared_secret)?);
+
+                shared_secret.delete(&mut self.trussed);
+            }
+
+            Subcommand::GetPinUvAuthTokenUsingUvWithPermissions | Subcommand::GetUVRetries => {
+                // todo!("not implemented yet")
+                return Err(Error::InvalidParameter);
+            }
+
+            _ => {
+                return Err(Error::InvalidParameter);
+            }
+        }
+
+        Ok(response)
+    }
+
+    #[inline(never)]
+    fn credential_management(
+        &mut self,
+        parameters: &ctap2::credential_management::Request<'_>,
+    ) -> Result<ctap2::credential_management::Response> {
+        use credential_management as cm;
+        use ctap2::credential_management::Subcommand;
+
+        self.verify_credential_management_pin_auth(parameters)?;
+
+        let mut cred_mgmt = cm::CredentialManagement::new(self);
+        let sub_parameters = &parameters.sub_command_params;
+        // TODO: use custom enum of known commands
+        match parameters.sub_command {
+            // 0x1
+            Subcommand::GetCredsMetadata => cred_mgmt.get_creds_metadata(),
+
+            // 0x2
+            Subcommand::EnumerateRpsBegin => cred_mgmt.first_relying_party(),
+
+            // 0x3
+            Subcommand::EnumerateRpsGetNextRp => cred_mgmt.next_relying_party(),
+
+            // 0x4
+            Subcommand::EnumerateCredentialsBegin => {
+                let sub_parameters = sub_parameters.as_ref().ok_or(Error::MissingParameter)?;
+
+                cred_mgmt.first_credential(
+                    sub_parameters
+                        .rp_id_hash
+                        .as_ref()
+                        .ok_or(Error::MissingParameter)?,
+                )
+            }
+
+            // 0x5
+            Subcommand::EnumerateCredentialsGetNextCredential => cred_mgmt.next_credential(),
+
+            // 0x6
+            Subcommand::DeleteCredential => {
+                let sub_parameters = sub_parameters.as_ref().ok_or(Error::MissingParameter)?;
+
+                cred_mgmt.delete_credential(
+                    sub_parameters
+                        .credential_id
+                        .as_ref()
+                        .ok_or(Error::MissingParameter)?,
+                )
+            }
+
+            // 0x7
+            Subcommand::UpdateUserInformation => {
+                let sub_parameters = sub_parameters.as_ref().ok_or(Error::MissingParameter)?;
+                let credential_id = sub_parameters
+                    .credential_id
+                    .as_ref()
+                    .ok_or(Error::MissingParameter)?;
+                let user = sub_parameters
+                    .user
+                    .as_ref()
+                    .ok_or(Error::MissingParameter)?;
+
+                cred_mgmt.update_user_information(credential_id, user)
+            }
+
+            _ => Err(Error::InvalidParameter),
+        }
+    }
+
+    #[inline(never)]
+    fn vendor(&mut self, op: VendorOperation) -> Result<()> {
+        info_now!("hello VO {:?}", &op);
+        match op.into() {
+            0x79 => {
+                #[allow(deprecated)]
+                {
+                    syscall!(self.trussed.debug_dump_store());
+                }
+                Err(Error::InvalidCommand)
+            }
+            _ => Err(Error::InvalidCommand),
+        }
+    }
+
+    #[inline(never)]
+    fn get_assertion_into(
+        &mut self,
+        parameters: &ctap2::get_assertion::Request,
+        response: &mut ctap2::get_assertion::Response,
+    ) -> Result<()> {
+        debug_now!("remaining stack size: {} bytes", msp() - 0x2000_0000);
+
+        // CTAP 2.1 §6.2.1.2: rpId must be present and non-empty.
+        if parameters.rp_id.is_empty() {
+            return Err(Error::MissingParameter);
+        }
+        let rp_id_hash = self.hash(parameters.rp_id.as_ref());
+
+        // 1-4.
+        let uv_performed = match self.pin_prechecks(
+            &parameters.options,
+            parameters.pin_auth.map(AsRef::as_ref),
+            parameters.pin_protocol,
+            parameters.client_data_hash.as_ref(),
+            Permissions::GET_ASSERTION,
+            parameters.rp_id,
+        ) {
+            Ok(b) => b,
+            Err(Error::PinRequired) => {
+                // UV is optional for `getAssertion` by default — pin_prechecks
+                // raises PinRequired for the "RK + clientPin set + no pin_auth"
+                // case, and the spec lets GA proceed without UV. The
+                // alwaysUv branch (CTAP 2.1 §6.2.2 step 5) is already
+                // enforced inside pin_prechecks — it inspects the
+                // permissions parameter and the request's `up` option to
+                // honour the "up must be true" condition, so any
+                // alwaysUv-driven `PinRequired` reaching us here has
+                // already been adjudicated and we just propagate it.
+                if self.state.persistent.always_uv() {
+                    return Err(Error::PinRequired);
+                }
+                false
+            }
+            Err(err) => return Err(err),
+        };
+
+        // 5. Locate eligible credentials
+        //
+        // Note: If allowList is passed, credential is Some(credential)
+        // If no allowList is passed, credential is None and the retrieved credentials
+        // are stored in state.runtime.credential_heap
+        let prepared =
+            self.prepare_credentials(&rp_id_hash, &parameters.allow_list, uv_performed)?;
+
+        // 6. process any options present
+
+        // RK is not supported in get_assertion
+        if parameters
+            .options
+            .as_ref()
+            .and_then(|options| options.rk)
+            .is_some()
+        {
+            return Err(Error::InvalidOption);
+        }
+
+        // UP occurs by default, but option could specify not to.
+        let do_up = if let Some(options) = parameters.options.as_ref() {
+            options.up.unwrap_or(true)
+        } else {
+            true
+        };
+
+        // 7. collect user presence — MUST happen before returning
+        // NoCredentials per CTAP 2.0 §5.2 step 2 (privacy: don't reveal
+        // credential existence without UP).
+        let up_performed = if do_up {
+            if !self.skip_up_check() {
+                info_now!("asking for up");
+                self.up
+                    .user_present(&mut self.trussed, self.config.fido2_up_timeout())?;
+            }
+            true
+        } else {
+            info_now!("not asking for up");
+            false
+        };
+
+        // 8. Now safe to bail with NoCredentials (UP collected).
+        let (credential, num_credentials) = prepared.ok_or(Error::NoCredentials)?;
+
+        info_now!("found {:?} applicable credentials", num_credentials);
+        info_now!("{:?}", &credential);
+
+        let multiple_credentials = num_credentials > 1;
+        self.state.runtime.active_get_assertion = Some(state::ActiveGetAssertionData {
+            rp_id_hash: {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(&rp_id_hash);
+                buf
+            },
+            client_data_hash: {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(parameters.client_data_hash);
+                buf
+            },
+            uv_performed,
+            up_performed,
+            multiple_credentials,
+            extensions: parameters.extensions.clone(),
+            attestation_formats_preference: parameters.attestation_formats_preference.clone(),
+        });
+
+        let num_credentials = match num_credentials {
+            1 => None,
+            n => Some(n),
+        };
+
+        self.assert_with_credential(num_credentials, &credential, response)
+    }
+
+    #[inline(never)]
+    fn large_blobs(
+        &mut self,
+        request: &ctap2::large_blobs::Request,
+    ) -> Result<ctap2::large_blobs::Response> {
+        let Some(config) = self.config.large_blobs else {
+            return Err(Error::InvalidCommand);
+        };
+
+        // 1. offset is validated by serde
+
+        // 2.-3. Exactly one of get or set must be present
+        match (request.get, request.set) {
+            (None, None) | (Some(_), Some(_)) => Err(Error::InvalidParameter),
+            // 4. Implement get subcommand
+            (Some(get), None) => self.large_blobs_get(request, config, get),
+            // 5. Implement set subcommand
+            (None, Some(set)) => self.large_blobs_set(request, config, set),
+        }
+    }
+}
+
+// impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenticator<UP, T>
+impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
+    // https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#setMinPINLength
+    fn config_set_min_pin_length(&mut self, request: &ctap2::config::Request<'_>) -> Result<()> {
+        let params = request
+            .sub_command_params
+            .as_ref()
+            .ok_or(Error::MissingParameter)?;
+
+        // 2.1. If newMinPINLength is absent, then let newMinPINLength be present
+        // with the value of current minimum PIN length.
+        let new_min_pin_length = params
+            .new_min_pin_length
+            .unwrap_or(self.state.persistent.min_pin_length());
+
+        // 2.2. If minPinLengthRPIDs is present and the authenticator does not
+        // support the minPinLength extension, return CTAP1_ERR_INVALID_PARAMETER.
+        // NOTHING TO DO HERE
+
+        // 2.3. If newMinPINLength is less than the current minimum PIN length,
+        // return CTAP2_ERR_PIN_POLICY_VIOLATION.
+        if new_min_pin_length < self.state.persistent.min_pin_length() {
+            return Err(Error::PinPolicyViolation);
+        }
+
+        // 2.4. If the value of forceChangePin is true, then:
+        if params.force_change_pin == Some(true) {
+            // 2.4.1. If the value of clientPIN is false, then return CTAP2_ERR_PIN_NOT_SET.
+            if !self.state.persistent.pin_is_set() {
+                return Err(Error::PinNotSet);
+            }
+            // 2.4.2. Let the value of the forcePINChange authenticatorGetInfo response member be true.
+            self.state
+                .persistent
+                .set_force_pin_change(&mut self.trussed, true)?;
+        }
+
+        // 2.5. If the value of PINCodePointLength is less than newMinPINLength
+        // and the value of clientPIN is true then let the value of the
+        // forcePINChange member of the authenticatorGetInfo response be true.
+        if self.state.persistent.pin_code_point_length() < new_min_pin_length
+            && self.state.persistent.pin_is_set()
+        {
+            self.state
+                .persistent
+                .set_force_pin_change(&mut self.trussed, true)?;
+        }
+
+        // 2.6. Authenticator stores newMinPINLength as minPINLength.
+        self.state
+            .persistent
+            .set_min_pin_length(&mut self.trussed, new_min_pin_length)?;
+
+        // 2.7. If minPinLengthRPIDs is present and contains at least one string, then:
+        if let Some(rp_ids) = params
+            .min_pin_length_rp_ids
+            .as_ref()
+            .filter(|v| !v.is_empty())
+        {
+            // If the authenticator does not have a pre-configured list of
+            // RP IDs authorized to receive the current minimum PIN length
+            // value, the authenticator stores the minPinLengthRPIDs
+            // parameter's list as the entire list of RP IDs authorized to
+            // receive the current minimum PIN length value.
+            //
+            // Otherwise, if the authenticator has a pre-configured list of
+            // RP IDs authorized to receive the current minimum PIN length
+            // value, it adds the minPinLengthRPIDs parameter's list to the
+            // immutable pre-configured list. Any previously added RP IDs
+            // are overwritten.
+            //
+            // Note: How the authenticator "adds" the minPinLengthRPIDs
+            // parameter's list to the pre-configured list is an
+            // implementation detail.
+            //
+            // If the authenticator cannot store or add the minPinLengthRPIDs,
+            // it returns CTAP2_ERR_KEY_STORE_FULL.
+            let mut owned: heapless::Vec<
+                heapless::String<MAX_RP_ID_LENGTH>,
+                MAX_MIN_PIN_LENGTH_RP_IDS,
+            > = heapless::Vec::new();
+            for id in rp_ids {
+                let stored = heapless::String::try_from(*id).map_err(|_| Error::KeyStoreFull)?;
+                owned.push(stored).map_err(|_| Error::KeyStoreFull)?;
+            }
+            self.state
+                .persistent
+                .set_min_pin_length_rp_ids(&mut self.trussed, owned)
+                .map_err(|_| Error::KeyStoreFull)?;
+        }
+
+        // 2.8. Authenticator returns CTAP2_OK.
+        Ok(())
+    }
+
+    fn parse_pin_protocol(&self, version: impl TryInto<u8>) -> Result<PinProtocolVersion> {
+        if let Ok(version) = version.try_into() {
+            for pin_protocol in self.pin_protocols() {
+                if u8::from(*pin_protocol) == version {
+                    return Ok(*pin_protocol);
+                }
+            }
+        }
+        Err(Error::InvalidParameter)
+    }
+
+    // This is the single source of truth for the supported PIN protocols.
+    fn pin_protocols(&self) -> &'static [PinProtocolVersion] {
+        &[PinProtocolVersion::V2, PinProtocolVersion::V1]
+    }
+
+    fn pin_protocol(&mut self, pin_protocol: PinProtocolVersion) -> PinProtocol<'_, T> {
+        let state = self.state.runtime.pin_protocol(&mut self.trussed);
+        PinProtocol::new(&mut self.trussed, state, pin_protocol)
+    }
+
+    #[inline(never)]
+    fn check_credential_applicable(
+        &mut self,
+        credential: &Credential,
+        allowlist_passed: bool,
+        uv_performed: bool,
+    ) -> bool {
+        if !self.check_key_exists(credential.algorithm(), credential.key()) {
+            return false;
+        }
+
+        if !{
+            use credential::CredentialProtectionPolicy as Policy;
+            debug_now!("CredentialProtectionPolicy {:?}", credential.cred_protect());
+            match credential.cred_protect() {
+                None | Some(Policy::Optional) => true,
+                Some(Policy::OptionalWithCredentialIdList) => allowlist_passed || uv_performed,
+                Some(Policy::Required) => uv_performed,
+            }
+        } {
+            return false;
+        }
+        true
+    }
+
+    #[inline(never)]
+    fn prepare_credentials(
+        &mut self,
+        rp_id_hash: &[u8; 32],
+        allow_list: &Option<ctap2::get_assertion::AllowList>,
+        uv_performed: bool,
+    ) -> Result<Option<(Credential, u32)>> {
+        debug_now!("remaining stack size: {} bytes", msp() - 0x2000_0000);
+
+        self.state.runtime.clear_credential_cache();
+        self.state.runtime.active_get_assertion = None;
+
+        // NB: CTAP 2.1 specifies to return the first applicable credential, and set
+        // numberOfCredentials to None.
+        // However, CTAP 2.0 says to send numberOfCredentials that are applicable,
+        // which implies we'd have to respond to GetNextAssertion.
+        //
+        // We are using CTAP 2.1 behaviour here, as it allows us not to cache the (length)
+        // credential IDs. Presumably, most clients use this to just get any old signatures,
+        // but we did change the github.com/solokeys/fido2-tests to accommodate this change
+        // of behaviour.
+        if let Some(allow_list) = allow_list {
+            debug_now!("Allowlist of len {} passed, filtering", allow_list.len());
+            // we will have at most one credential, and an empty cache.
+
+            // client is not supposed to send Some(empty list):
+            // <https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#:~:text=A%20platform%20MUST%20NOT%20send%20an%20empty%20allowList%E2%80%94if%20it%20would%20be%20empty%20it%20MUST%20be%20omitted>
+            // but some still do (and CTAP 2.0 does not rule it out).
+            // they probably meant to send None.
+            if !allow_list.is_empty() {
+                for credential_id in allow_list {
+                    let mut credential = match Credential::try_from(self, rp_id_hash, credential_id)
+                    {
+                        Ok(credential) => credential,
+                        _ => continue,
+                    };
+
+                    if !self.check_credential_applicable(&credential, true, uv_performed) {
+                        continue;
+                    }
+
+                    // CTAP 2.1 §6.2.3 — for resident credentials referenced
+                    // via allowList, the response must include the `user`
+                    // field. Modern versions of this app encrypt only a
+                    // Stripped credential into `credential_id`, which omits
+                    // user data. For RKs we recover the FullCredential from
+                    // disk by hashing the credential_id. If the RK file is
+                    // missing or corrupt the credential is treated as
+                    // unusable — skip it and try the next allow-list entry
+                    // (the Stripped form lacks the data the platform expects
+                    // for an RK match).
+                    if let Credential::Stripped(stripped) = &credential {
+                        if matches!(stripped.key, Key::ResidentKey(_)) {
+                            let credential_id_hash = self.hash(credential_id.id);
+                            let rk_path = rk_path(rp_id_hash, &credential_id_hash);
+                            let credential_data = match try_syscall!(self
+                                .trussed
+                                .read_file(Location::Internal, rk_path))
+                            {
+                                Ok(reply) => reply.data,
+                                Err(_) => continue,
+                            };
+                            match FullCredential::deserialize(&credential_data) {
+                                Ok(full_credential) => {
+                                    credential = Credential::Full(full_credential);
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                    }
+
+                    return Ok(Some((credential, 1)));
+                }
+
+                // we don't recognize any credentials in the allowlist
+                return Ok(None);
+            }
+        }
+
+        // we are only dealing with discoverable credentials.
+        debug_now!("Allowlist not passed, fetching RKs");
+        self.prepare_cache(rp_id_hash, uv_performed)?;
+
+        let num_credentials = self.state.runtime.remaining_credentials();
+        let credential = self.state.runtime.pop_credential(&mut self.trussed);
+        Ok(credential.map(|credential| (Credential::Full(credential), num_credentials)))
+    }
+
+    /// Populate the cache with the RP credentials.
+    #[inline(never)]
+    fn prepare_cache(&mut self, rp_id_hash: &[u8; 32], uv_performed: bool) -> Result<()> {
+        use crate::state::CachedCredential;
+        use core::str::FromStr;
+
+        let file_name_prefix = rp_file_name_prefix(rp_id_hash);
+        let mut maybe_entry = syscall!(self.trussed.read_dir_first_alphabetical(
+            Location::Internal,
+            PathBuf::from(RK_DIR),
+            Some(file_name_prefix.clone())
+        ))
+        .entry;
+
+        while let Some(entry) = maybe_entry.take() {
+            if !entry
+                .file_name()
+                .as_ref()
+                .starts_with(file_name_prefix.as_ref())
+            {
+                // We got past all credentials for the relevant RP
+                break;
+            }
+
+            if entry.file_name() == &*file_name_prefix {
+                debug_assert!(entry.metadata().is_dir());
+                error!("Migration missing");
+                return Err(Error::Other);
+            }
+
+            let credential_data = syscall!(self
+                .trussed
+                .read_file(Location::Internal, entry.path().into(),))
+            .data;
+
+            let credential = FullCredential::deserialize(&credential_data).map_err(|_err| {
+                error!("Failed to deserialize credential: {_err:?}");
+                Error::Other
+            })?;
+            let timestamp = credential.creation_time;
+            let credential = Credential::Full(credential);
+
+            if self.check_credential_applicable(&credential, false, uv_performed) {
+                self.state.runtime.push_credential(CachedCredential {
+                    timestamp,
+                    path: String::from_str(entry.path().as_str_ref_with_trailing_nul())
+                        .map_err(|_| Error::Other)?,
+                });
+            }
+
+            maybe_entry = syscall!(self.trussed.read_dir_next()).entry;
+        }
+        Ok(())
+    }
+
+    fn decrypt_pin_hash_and_maybe_escalate(
+        &mut self,
+        pin_protocol: PinProtocolVersion,
+        shared_secret: &SharedSecret,
+        pin_hash_enc: &[u8],
+    ) -> Result<()> {
+        let pin_hash = shared_secret
+            .decrypt(&mut self.trussed, pin_hash_enc)
+            .ok_or(Error::Other)?;
+
+        let stored_pin_hash = match self.state.persistent.pin_hash() {
+            Some(hash) => hash,
+            None => {
+                return Err(Error::PinNotSet);
+            }
+        };
+
+        if pin_hash != stored_pin_hash {
+            // I) generate new KEK
+            self.pin_protocol(pin_protocol).regenerate();
+            self.state.pin_blocked()?;
+            return Err(Error::PinInvalid);
+        }
+
+        Ok(())
+    }
+
+    fn hash_store_pin(&mut self, pin: &Message) -> Result<()> {
+        let pin_hash_32 = syscall!(self.trussed.hash_sha256(pin)).hash;
+        let pin_hash: [u8; 16] = pin_hash_32[..16].try_into().unwrap();
+        // CTAP 2.1 §6.5.5.5: persist PINCodePointLength alongside the hash so
+        // §6.11.4 step 2.5 can compare it against newMinPINLength later. We
+        // count code points best-effort here (full UTF-8 validation is the
+        // §6.5.5 PIN-audit commit's job); on non-UTF-8 input we fall back to
+        // byte count, a safe upper bound for the step-2.5 check.
+        let pin_code_point_length = core::str::from_utf8(pin)
+            .map(|s| s.chars().count())
+            .unwrap_or(pin.len()) as u8;
+        self.state
+            .persistent
+            .set_pin_hash(&mut self.trussed, pin_hash, pin_code_point_length)
+            .unwrap();
+
+        Ok(())
+    }
+
+    fn decrypt_pin_check_length(
+        &mut self,
+        shared_secret: &SharedSecret,
+        pin_enc: &[u8],
+    ) -> Result<Message> {
+        // pin is expected to be filled with null bytes to length at least 64
+        if pin_enc.len() < 64 {
+            // correct error?
+            return Err(Error::PinPolicyViolation);
+        }
+
+        let mut pin = shared_secret
+            .decrypt(&mut self.trussed, pin_enc)
+            .ok_or(Error::Other)?;
+
+        // CTAP 2.1 §6.5.5.5 / §6.5.5.6: "The authenticator drops all
+        // **trailing** 0x00 bytes from paddedNewPin to produce newPin."
+        // Embedded nulls stay (they will fail UTF-8 validation if invalid).
+        let stripped_len = pin.iter().rposition(|&b| b != 0).map_or(0, |last| last + 1);
+
+        // CTAP 2.1 §6.5.5.3: "Maximum PIN Length: 63 bytes."
+        if stripped_len > ctap2::client_pin::MAX_PIN_LENGTH {
+            return Err(Error::PinPolicyViolation);
+        }
+
+        // Issue #43: minimum PIN length is measured in **Unicode code points**,
+        // not bytes. UTF-8-decode the stripped bytes and count `chars()`. A
+        // platform that sends non-UTF-8 bytes violates the spec; we reject
+        // with the same PIN_POLICY_VIOLATION code we use for length issues.
+        let s =
+            core::str::from_utf8(&pin[..stripped_len]).map_err(|_| Error::PinPolicyViolation)?;
+        let code_points = s.chars().count();
+        let min_pin_length = usize::from(self.state.persistent.min_pin_length());
+        if code_points < min_pin_length {
+            return Err(Error::PinPolicyViolation);
+        }
+
+        pin.resize_zero(stripped_len).unwrap();
+
+        Ok(pin)
+    }
+
+    fn verify_credential_management_pin_auth(
+        &mut self,
+        parameters: &ctap2::credential_management::Request,
+    ) -> Result<()> {
+        use ctap2::credential_management::Subcommand;
+        let rp_scope = match parameters.sub_command {
+            Subcommand::EnumerateCredentialsBegin => {
+                let rp_id_hash = parameters
+                    .sub_command_params
+                    .as_ref()
+                    .and_then(|subparams| subparams.rp_id_hash)
+                    .ok_or(Error::MissingParameter)?;
+                RpScope::RpIdHash(rp_id_hash)
+            }
+            Subcommand::DeleteCredential | Subcommand::UpdateUserInformation => {
+                // TODO: determine RP ID from credential ID
+                RpScope::All
+            }
+            _ => RpScope::All,
+        };
+        match parameters.sub_command {
+            Subcommand::GetCredsMetadata
+            | Subcommand::EnumerateRpsBegin
+            | Subcommand::EnumerateCredentialsBegin
+            | Subcommand::DeleteCredential
+            | Subcommand::UpdateUserInformation => {
+                // check pinProtocol
+                let pin_protocol = parameters.pin_protocol.ok_or(Error::MissingParameter)?;
+                let pin_protocol = self.parse_pin_protocol(pin_protocol)?;
+
+                // check pinAuth
+                let mut data: Bytes<{ sizes::MAX_CREDENTIAL_ID_LENGTH_PLUS_256 }> =
+                    Bytes::from(&[parameters.sub_command as u8]);
+                let len = 1 + match parameters.sub_command {
+                    Subcommand::EnumerateCredentialsBegin
+                    | Subcommand::DeleteCredential
+                    | Subcommand::UpdateUserInformation => {
+                        data.resize_to_capacity();
+                        // ble, need to reserialize
+                        cbor_smol::cbor_serialize(
+                            &parameters
+                                .sub_command_params
+                                .as_ref()
+                                .ok_or(Error::MissingParameter)?,
+                            &mut data[1..],
+                        )
+                        .map_err(|_| Error::LimitExceeded)?
+                        .len()
+                    }
+                    _ => 0,
+                };
+
+                let pin_auth = parameters
+                    .pin_auth
+                    .as_ref()
+                    .ok_or(Error::MissingParameter)?;
+
+                let mut pin_protocol = self.pin_protocol(pin_protocol);
+                if let Ok(pin_token) = pin_protocol.verify_pin_token(&data[..len], pin_auth) {
+                    info_now!("passed pinauth");
+                    pin_token.require_permissions(Permissions::CREDENTIAL_MANAGEMENT)?;
+                    pin_token.require_valid_for_rp(rp_scope)?;
+                    Ok(())
+                } else {
+                    info_now!("failed pinauth!");
+                    self.state.decrement_retries(&mut self.trussed)?;
+                    let maybe_blocked = self.state.pin_blocked();
+                    if maybe_blocked.is_err() {
+                        info_now!("blocked");
+                        maybe_blocked
+                    } else {
+                        info_now!("pinAuthInvalid");
+                        Err(Error::PinAuthInvalid)
+                    }
+                }
+            }
+
+            // don't need the PIN auth, they're continuations
+            // of already checked CredMgmt subcommands
+            Subcommand::EnumerateRpsGetNextRp
+            | Subcommand::EnumerateCredentialsGetNextCredential => Ok(()),
+
+            _ => Err(Error::InvalidParameter),
+        }
+    }
+
+    /// Returns whether UV was performed.
+    fn pin_prechecks(
+        &mut self,
+        options: &Option<ctap2::AuthenticatorOptions>,
+        pin_auth: Option<&[u8]>,
+        pin_protocol: Option<u32>,
+        data: &[u8],
+        permissions: Permissions,
+        rp_id: &str,
+    ) -> Result<bool> {
+        // 0. CTAP 2.1 §6.5.5.7 / §6.4.0x0C: while `forcePINChange` is set the
+        // authenticator MUST refuse every PIN-protected operation until the
+        // platform calls `clientPin.changePIN`.
+        if self.state.persistent.force_pin_change() {
+            return Err(Error::PinPolicyViolation);
+        }
+
+        // 0b. CTAP 2.1 §6.1.2 step 6 / §6.2.2 step 5: when alwaysUv is
+        // enabled, both MC and GA must reject a missing pinUvAuthParam with
+        // CTAP2_ERR_PUAT_REQUIRED (wire 0x36 — `Error::PinRequired` is
+        // ctap-types' legacy name). Subtle difference: §6.2.2 step 5 only
+        // applies when the "up" option is true (the default), so an
+        // explicit `up=false` GA (a silent pre-flight check) bypasses the
+        // alwaysUv UV requirement per spec. MC has no such carve-out —
+        // `up=Some(false)` is rejected upstream with INVALID_OPTION, so we
+        // only need to skip the up check for non-GA permissions.
+        if self.state.persistent.always_uv() && pin_auth.is_none() {
+            let is_ga = permissions == Permissions::GET_ASSERTION;
+            let up_true = !is_ga || options.as_ref().and_then(|o| o.up).unwrap_or(true);
+            if up_true {
+                return Err(Error::PinRequired);
+            }
+        }
+
+        // 1. pinAuth zero length -> wait for user touch, then
+        // return PinNotSet if not set, PinInvalid if set
+        //
+        // the idea is for multi-authnr scenario where platform
+        // wants to enforce PIN and needs to figure out which authnrs support PIN
+        // (CTAP 2.1 §6.5.5.7 step 2 — was upstream PR #56; the older
+        // CTAP 2.0 reading was `PinAuthInvalid` for the "pin set" case.)
+        if let Some(pin_auth) = pin_auth {
+            if pin_auth.is_empty() {
+                self.up
+                    .user_present(&mut self.trussed, self.config.fido2_up_timeout())?;
+                if !self.state.persistent.pin_is_set() {
+                    return Err(Error::PinNotSet);
+                } else {
+                    return Err(Error::PinInvalid);
+                }
+            }
+        }
+
+        // 2. check PIN protocol is 1 if pinAuth was sent
+        let pin_protocol = if pin_auth.is_some() {
+            let pin_protocol = pin_protocol.ok_or(Error::MissingParameter)?;
+            let pin_protocol = self.parse_pin_protocol(pin_protocol)?;
+            Some(pin_protocol)
+        } else {
+            None
+        };
+
+        // 3. if no PIN is set (we have no other form of UV),
+        // and platform sent `uv` or `pinAuth`, return InvalidOption
+        if !self.state.persistent.pin_is_set() {
+            if let Some(ref options) = &options {
+                if Some(true) == options.uv {
+                    return Err(Error::InvalidOption);
+                }
+            }
+            if pin_auth.is_some() {
+                return Err(Error::InvalidOption);
+            }
+        }
+
+        // 4. If authenticator is protected by som form of user verification, do it
+
+        // Reject uv = true as we do not support built-in user verification
+        if pin_auth.is_none() && options.as_ref().and_then(|options| options.uv) == Some(true) {
+            return Err(Error::InvalidOption);
+        }
+
+        if self.state.persistent.pin_is_set() {
+            // let mut uv_performed = false;
+            if let Some(pin_auth) = pin_auth {
+                // seems a bit redundant to check here in light of 2.
+                // I guess the CTAP spec writers aren't implementers :D
+                if let Some(pin_protocol) = pin_protocol {
+                    // 5. if pinAuth is present and pinProtocol = 1, verify
+                    // success --> set uv = 1
+                    // error --> PinAuthInvalid
+                    let mut pin_protocol = self.pin_protocol(pin_protocol);
+                    let pin_token = pin_protocol.verify_pin_token(data, pin_auth)?;
+                    pin_token.require_permissions(permissions)?;
+                    pin_token.require_valid_for_rp(RpScope::RpId(rp_id))?;
+
+                    return Ok(true);
+                } else {
+                    // 7. pinAuth present + pinProtocol != 1 --> error PinAuthInvalid
+                    return Err(Error::PinAuthInvalid);
+                }
+            } else {
+                // 6. pinAuth not present + clientPin set + rk = true --> error PinRequired
+                if options.as_ref().and_then(|options| options.rk) == Some(true) {
+                    return Err(Error::PinRequired);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    #[inline(never)]
+    fn check_key_exists(&mut self, alg: i32, key: &Key) -> bool {
+        match key {
+            // TODO: should check if wrapped key is valid AEAD
+            // On the other hand, we already decrypted a valid AEAD
+            Key::WrappedKey(_) => true,
+            Key::ResidentKey(key) => {
+                debug_now!("checking if ResidentKey {:?} exists", key);
+                SigningAlgorithm::try_from(alg)
+                    .map(|alg| syscall!(self.trussed.exists(alg.mechanism(), *key)).exists)
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn process_assertion_extensions(
+        &mut self,
+        get_assertion_state: &state::ActiveGetAssertionData,
+        extensions: &ctap2::get_assertion::ExtensionsInput,
+        credential: &Credential,
+        credential_key: KeyId,
+    ) -> Result<Option<ctap2::get_assertion::ExtensionsOutput>> {
+        let mut output = ctap2::get_assertion::ExtensionsOutput::default();
+
+        if let Some(hmac_secret) = &extensions.hmac_secret {
+            let hmac_secret_output = self.process_hmac_secret_extension(
+                !get_assertion_state.up_performed,
+                hmac_secret,
+                credential_key,
+                get_assertion_state.uv_performed,
+            )?;
+            output.hmac_secret = Some(hmac_secret_output);
+        }
+
+        if extensions.third_party_payment.unwrap_or_default() {
+            output.third_party_payment = Some(credential.third_party_payment().unwrap_or_default());
+        }
+
+        if extensions.cred_blob.unwrap_or(false) {
+            // Spec: if the extension was requested but no blob is associated
+            // with the credential, return an empty byte string (not absent).
+            output.cred_blob = Some(credential.cred_blob().cloned().unwrap_or_else(Bytes::new));
+        }
+
+        Ok(output.is_set().then_some(output))
+    }
+
+    #[inline(never)]
+    fn process_hmac_secret_extension(
+        &mut self,
+        return_unsupported_option: bool,
+        hmac_secret: &HmacSecretInput,
+        private_key: KeyId,
+        uv_performed: bool,
+    ) -> Result<Bytes<80>> {
+        let pin_protocol = hmac_secret
+            .pin_protocol
+            .map(|i| self.parse_pin_protocol(i))
+            .transpose()?
+            .unwrap_or(PinProtocolVersion::V1);
+
+        if return_unsupported_option {
+            return Err(Error::UnsupportedOption);
+        }
+
+        // We derive credRandom as an hmac of the existing private key.
+        // UV is used as input data since credRandom should depend UV
+        // i.e. credRandom = HMAC(private_key, uv)
+        let cred_random = syscall!(self.trussed.derive_key(
+            Mechanism::HmacSha256,
+            private_key,
+            Some(Bytes::from(&[uv_performed as u8])),
+            StorageAttributes::new().set_persistence(Location::Volatile),
+        ))
+        .key;
+
+        // Every error path below must delete cred_random and (once
+        // allocated) shared_secret before returning, else volatile FS
+        // entries leak and starve the next shared_secret_impl call.
+        let mut pin_protocol = self.pin_protocol(pin_protocol);
+        let shared_secret = match pin_protocol.shared_secret(&hmac_secret.key_agreement) {
+            Ok(s) => s,
+            Err(e) => {
+                syscall!(self.trussed.delete(cred_random));
+                return Err(e);
+            }
+        };
+        if let Err(e) = pin_protocol.verify_pin_auth(
+            &shared_secret,
+            &hmac_secret.salt_enc,
+            &hmac_secret.salt_auth,
+        ) {
+            shared_secret.delete(&mut self.trussed);
+            syscall!(self.trussed.delete(cred_random));
+            return Err(e);
+        }
+
+        let salts = match shared_secret.decrypt(&mut self.trussed, &hmac_secret.salt_enc) {
+            Some(s) => s,
+            None => {
+                shared_secret.delete(&mut self.trussed);
+                syscall!(self.trussed.delete(cred_random));
+                return Err(Error::InvalidOption);
+            }
+        };
+        if salts.len() != 32 && salts.len() != 64 {
+            debug_now!("invalid hmac-secret salt length");
+            shared_secret.delete(&mut self.trussed);
+            syscall!(self.trussed.delete(cred_random));
+            return Err(Error::InvalidLength);
+        }
+
+        let mut salt_output: Bytes<64> = Bytes::new();
+        let output1 = syscall!(self.trussed.sign_hmacsha256(cred_random, &salts[0..32])).signature;
+        salt_output.extend_from_slice(&output1).unwrap();
+        if salts.len() == 64 {
+            let output2 =
+                syscall!(self.trussed.sign_hmacsha256(cred_random, &salts[32..64])).signature;
+            salt_output.extend_from_slice(&output2).unwrap();
+        }
+
+        syscall!(self.trussed.delete(cred_random));
+
+        let output_enc = shared_secret.encrypt(&mut self.trussed, &salt_output);
+        shared_secret.delete(&mut self.trussed);
+
+        Bytes::try_from(&*output_enc).map_err(|_| Error::Other)
+    }
+
+    #[inline(never)]
+    fn assert_with_credential(
+        &mut self,
+        num_credentials: Option<u32>,
+        credential: &Credential,
+        response: &mut ctap2::get_assertion::Response,
+    ) -> Result<()> {
+        let data = self.state.runtime.active_get_assertion.clone().unwrap();
+        let credential_id_version = self.state.persistent.credential_id_version();
+        let rp_id_hash = &data.rp_id_hash;
+
+        let (key, is_rk) = match credential.key().clone() {
+            Key::ResidentKey(key) => (key, true),
+            Key::WrappedKey(bytes) => {
+                let wrapping_key = self.state.persistent.key_wrapping_key(&mut self.trussed)?;
+                // info_now!("unwrapping {:?} with wrapping key {:?}", &bytes, &wrapping_key);
+                let key_result =
+                    credential_id_version.unwrap_key(&mut self.trussed, wrapping_key, &bytes);
+                // debug_now!("key result: {:?}", &key_result);
+                info_now!("key result");
+                match key_result {
+                    Some(key) => (key, false),
+                    None => {
+                        return Err(Error::Other);
+                    }
+                }
+            }
+        };
+
+        // For a non-resident credential `key` was just unwrapped into volatile
+        // storage; every error path below must delete it or it is orphaned and
+        // leaks storage. Run the rest in a closure so a single cleanup covers
+        // all early returns.
+        let assertion_result = (|| -> Result<()> {
+            // 8. process any extensions present
+            let mut large_blob_key_requested = false;
+            let extensions_output = if let Some(extensions) = &data.extensions {
+                if self.config.supports_large_blobs() {
+                    if extensions.large_blob_key == Some(false) {
+                        // large_blob_key must be Some(true) or omitted
+                        return Err(Error::InvalidOption);
+                    }
+                    large_blob_key_requested = extensions.large_blob_key == Some(true);
+                }
+                self.process_assertion_extensions(&data, extensions, credential, key)?
+            } else {
+                None
+            };
+
+            // 9./10. sign clientDataHash || authData with "first" credential
+
+            // info_now!("signing with credential {:?}", &credential);
+            let kek = self
+                .state
+                .persistent
+                .key_encryption_key(&mut self.trussed)?;
+            let credential_id =
+                credential.id(&mut self.trussed, credential_id_version, kek, rp_id_hash)?;
+
+            use ctap2::AuthenticatorDataFlags as Flags;
+
+            let sig_count = self.state.persistent.signature_counter(&mut self.trussed)?;
+
+            let authenticator_data = ctap2::get_assertion::AuthenticatorData {
+                rp_id_hash,
+
+                flags: {
+                    let mut flags = Flags::empty();
+                    if data.up_performed {
+                        flags |= Flags::USER_PRESENCE;
+                    }
+                    if data.uv_performed {
+                        flags |= Flags::USER_VERIFIED;
+                    }
+                    if extensions_output.is_some() {
+                        flags |= Flags::EXTENSION_DATA;
+                    }
+                    flags
+                },
+
+                sign_count: sig_count,
+                attested_credential_data: None,
+                extensions: extensions_output,
+            };
+
+            let mut serialized_auth_data = authenticator_data.serialize()?;
+
+            // Sign auth_data ‖ cdh in place, truncated back after the att_stmt.
+            let auth_data_len = serialized_auth_data.len();
+            serialized_auth_data
+                .extend_from_slice(&data.client_data_hash)
+                .map_err(|_| Error::Other)?;
+
+            let signing_algorithm =
+                SigningAlgorithm::try_from(credential.algorithm()).map_err(|_| Error::Other)?;
+            let signature = Bytes::try_from(&*signing_algorithm.sign(
+                &mut self.trussed,
+                key,
+                &serialized_auth_data,
+            ))
+            .unwrap();
+
+            // select preferred format or skip attestation statement.
+            let att_stmt_fmt = data
+                .attestation_formats_preference
+                .as_ref()
+                .and_then(SupportedAttestationFormat::select);
+            match att_stmt_fmt {
+                Some(SupportedAttestationFormat::None) => {
+                    response.att_stmt =
+                        Some(AttestationStatement::None(NoneAttestationStatement {}));
+                }
+                Some(SupportedAttestationFormat::Packed) => {
+                    self.build_packed_att_stmt(
+                        &serialized_auth_data,
+                        &signature,
+                        credential.algorithm(),
+                        response,
+                    )?;
+                }
+                None => {}
+            }
+
+            // Drop the cdh again.
+            serialized_auth_data.truncate(auth_data_len);
+
+            if !is_rk {
+                syscall!(self.trussed.delete(key));
+            }
+
+            response.credential = credential_id.into();
+            response.auth_data = serialized_auth_data;
+            response.signature = signature;
+            response.number_of_credentials = num_credentials;
+
+            // User with empty IDs are ignored for compatibility
+            if is_rk {
+                if let Credential::Full(credential) = credential {
+                    if !credential.user.id().is_empty() {
+                        let mut user: PublicKeyCredentialUserEntity =
+                            credential.user.clone().into();
+                        // User identifiable information (name, DisplayName, icon) MUST not
+                        // be returned if user verification is not done by the authenticator.
+                        // For single account per RP case, authenticator returns "id" field.
+                        if !data.uv_performed || !data.multiple_credentials {
+                            user.icon = None;
+                            user.name = None;
+                            user.display_name = None;
+                        }
+                        response.user = Some(user);
+                    }
+                }
+
+                if large_blob_key_requested {
+                    debug!("Sending largeBlobKey in getAssertion");
+                    response.large_blob_key = match credential {
+                        Credential::Stripped(stripped) => stripped.large_blob_key,
+                        Credential::Full(full) => full.data.large_blob_key,
+                    };
+                }
+            }
+
+            Ok(())
+        })();
+
+        // On error, delete the orphaned non-resident key (resident keys are
+        // owned by the stored credential and must be kept). On success it was
+        // already deleted above.
+        if assertion_result.is_err() && !is_rk {
+            syscall!(self.trussed.delete(key));
+        }
+        assertion_result
+    }
+
+    /// Write a `Packed` attestation statement into `response.att_stmt`.
+    /// Outlined to keep its ~4.5 KB of temporaries out of the caller's frame.
+    #[inline(never)]
+    fn build_packed_att_stmt(
+        &mut self,
+        message: &[u8],
+        fallback_sig: &Bytes<{ ctap_types::sizes::MAX_PACKED_SIG_LENGTH }>,
+        fallback_alg: i32,
+        response: &mut ctap2::get_assertion::Response,
+    ) -> Result<()> {
+        let (attestation_maybe, _) = self.state.identity.attestation(&mut self.trussed);
+        let (sig, alg) = if let Some(attestation) = attestation_maybe.as_ref() {
+            let signing_algorithm = SigningAlgorithm::P256;
+            let att_sig = signing_algorithm.sign(&mut self.trussed, attestation.0, message);
+            (
+                Bytes::try_from(&*att_sig).map_err(|_| Error::Other)?,
+                signing_algorithm.into(),
+            )
+        } else {
+            (fallback_sig.clone(), fallback_alg)
+        };
+        response.att_stmt = Some(AttestationStatement::Packed(PackedAttestationStatement {
+            alg,
+            sig,
+            x5c: attestation_maybe.as_ref().map(|attestation| {
+                let cert = attestation.1.clone();
+                let mut x5c = Vec::new();
+                x5c.push(cert).ok();
+                x5c
+            }),
+        }));
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn delete_resident_key_by_user_id(
+        &mut self,
+        rp_id_hash: &[u8; 32],
+        user_id: &Bytes<64>,
+    ) -> Result<()> {
+        // Prepare to iterate over all credentials associated to RP.
+        let file_name_prefix = rp_file_name_prefix(rp_id_hash);
+        let mut maybe_entry = syscall!(self.trussed.read_dir_first_alphabetical(
+            Location::Internal,
+            PathBuf::from(RK_DIR),
+            Some(file_name_prefix.clone())
+        ))
+        .entry;
+
+        while let Some(entry) = maybe_entry.take() {
+            if !entry
+                .file_name()
+                .as_ref()
+                .starts_with(file_name_prefix.as_ref())
+            {
+                // We got past all credentials for the relevant RP
+                break;
+            }
+
+            if entry.file_name() == &*file_name_prefix {
+                debug_assert!(entry.metadata().is_dir());
+                error!("Migration missing");
+                return Err(Error::Other);
+            }
+
+            info_now!("this may be an RK: {:?}", &entry);
+            let rk_path = PathBuf::from(entry.path());
+
+            info_now!("checking RK {:?} for userId ", &rk_path);
+            let credential_data =
+                syscall!(self.trussed.read_file(Location::Internal, rk_path.clone(),)).data;
+            let credential_maybe = FullCredential::deserialize(&credential_data);
+
+            if let Ok(old_credential) = credential_maybe {
+                if old_credential.user.id() == user_id {
+                    match old_credential.key {
+                        credential::Key::ResidentKey(key) => {
+                            info_now!(":: deleting resident key");
+                            syscall!(self.trussed.delete(key));
+                        }
+                        _ => {
+                            warn_now!(":: WARNING: unexpected server credential in rk.");
+                        }
+                    }
+                    syscall!(self.trussed.remove_file(Location::Internal, rk_path,));
+
+                    info_now!("Overwriting previous rk tied to this userId.");
+                    break;
+                }
+            } else {
+                warn_now!("WARNING: Could not read RK.");
+            }
+
+            // prepare for next loop iteration
+            maybe_entry = syscall!(self.trussed.read_dir_next()).entry;
+        }
+
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub(crate) fn delete_resident_key_by_path(&mut self, rk_path: &Path) -> Result<()> {
+        info_now!("deleting RK {:?}", &rk_path);
+        let credential_data = syscall!(self
+            .trussed
+            .read_file(Location::Internal, PathBuf::from(rk_path),))
+        .data;
+        let credential_maybe = FullCredential::deserialize(&credential_data);
+        // info_now!("deleting credential {:?}", &credential);
+
+        if let Ok(credential) = credential_maybe {
+            match credential.key {
+                credential::Key::ResidentKey(key) => {
+                    info_now!(":: deleting resident key");
+                    syscall!(self.trussed.delete(key));
+                }
+                credential::Key::WrappedKey(_) => {}
+            }
+        } else {
+            // If for some reason there becomes a corrupt credential,
+            // we can still at least orphan the key rather then crash.
+            info_now!("Warning!  Orpaning a key.");
+        }
+
+        info_now!(":: deleting RK file {:?} itself", &rk_path);
+        syscall!(self
+            .trussed
+            .remove_file(Location::Internal, PathBuf::from(rk_path),));
+
+        Ok(())
+    }
+
+    fn large_blobs_get(
+        &mut self,
+        request: &ctap2::large_blobs::Request,
+        config: large_blobs::Config,
+        length: u32,
+    ) -> Result<ctap2::large_blobs::Response> {
+        debug!(
+            "large_blobs_get: length = {length}, offset = {}",
+            request.offset
+        );
+        // 1.-2. Validate parameters
+        if request.length.is_some()
+            || request.pin_uv_auth_param.is_some()
+            || request.pin_uv_auth_protocol.is_some()
+        {
+            error!("length/pin set");
+            return Err(Error::InvalidParameter);
+        }
+        // 3. Validate length
+        let Ok(length) = usize::try_from(length) else {
+            return Err(Error::InvalidLength);
+        };
+        if length > self.config.max_msg_size.saturating_sub(64) {
+            return Err(Error::InvalidLength);
+        }
+        // 4. Validate offset
+        let Ok(offset) = usize::try_from(request.offset) else {
+            error!("offset too large");
+            return Err(Error::InvalidParameter);
+        };
+        let stored_length = large_blobs::size(&mut self.trussed, config.location)?;
+        if offset > stored_length {
+            error!("offset: {offset}, stored_length: {stored_length}");
+            return Err(Error::InvalidParameter);
+        };
+        // 5. Return requested data
+        info!("Reading large-blob array from offset {offset}");
+        let data = large_blobs::read_chunk(&mut self.trussed, config.location, offset, length)?;
+        let mut response = ctap2::large_blobs::Response::default();
+        response.config = Some(data);
+        Ok(response)
+    }
+
+    fn large_blobs_set(
+        &mut self,
+        request: &ctap2::large_blobs::Request,
+        config: large_blobs::Config,
+        data: &[u8],
+    ) -> Result<ctap2::large_blobs::Response> {
+        debug!(
+            "large_blobs_set: |data| = {}, offset = {}, length = {:?}",
+            data.len(),
+            request.offset,
+            request.length
+        );
+        // 1. Validate data
+        if data.len() > self.config.max_msg_size.saturating_sub(64) {
+            return Err(Error::InvalidLength);
+        }
+        if request.offset == 0 {
+            // 2. Calculate expected length and offset
+            // 2.1. Require length
+            let Some(length) = request.length else {
+                return Err(Error::InvalidParameter);
+            };
+            // 2.2. Check that length is not too big
+            let Ok(length) = usize::try_from(length) else {
+                return Err(Error::LargeBlobStorageFull);
+            };
+            if length > config.max_size() {
+                return Err(Error::LargeBlobStorageFull);
+            }
+            // 2.3. Check that length is not too small
+            if length < large_blobs::MIN_SIZE {
+                return Err(Error::InvalidParameter);
+            }
+            // 2.4-5. Set expected length and offset
+            self.state.runtime.large_blobs.expected_length = length;
+            self.state.runtime.large_blobs.expected_next_offset = 0;
+        } else {
+            // 3. Validate parameters
+            if request.length.is_some() {
+                return Err(Error::InvalidParameter);
+            }
+        }
+
+        // 4. Validate offset
+        let Ok(offset) = usize::try_from(request.offset) else {
+            return Err(Error::InvalidSeq);
+        };
+        if offset != self.state.runtime.large_blobs.expected_next_offset {
+            return Err(Error::InvalidSeq);
+        }
+
+        // 5. Perform uv
+        // TODO: support alwaysUv
+        if self.state.persistent.pin_is_set() {
+            let Some(pin_uv_auth_param) = request.pin_uv_auth_param else {
+                return Err(Error::PinRequired);
+            };
+            let Some(pin_uv_auth_protocol) = request.pin_uv_auth_protocol else {
+                return Err(Error::PinRequired);
+            };
+            let pin_protocol = self.parse_pin_protocol(pin_uv_auth_protocol)?;
+            // verify_pin_token truncates per protocol (16 B for v1, 32 B
+            // for v2), so pass the full param.
+            let pin_auth: &[u8] = pin_uv_auth_param.as_ref();
+
+            let mut auth_data: Bytes<70> = Bytes::new();
+            // 32x 0xff
+            auth_data.resize(32, 0xff).unwrap();
+            // h'0c00'
+            auth_data.push(0x0c).unwrap();
+            auth_data.push(0x00).unwrap();
+            // uint32LittleEndian(offset)
+            auth_data
+                .extend_from_slice(&request.offset.to_le_bytes())
+                .unwrap();
+            // SHA-256(data)
+            auth_data.extend_from_slice(&Sha256::digest(data)).unwrap();
+
+            let mut pin_protocol = self.pin_protocol(pin_protocol);
+            let pin_token = pin_protocol.verify_pin_token(&auth_data, pin_auth)?;
+            pin_token.require_permissions(Permissions::LARGE_BLOB_WRITE)?;
+        }
+
+        // 6. Validate data length
+        if offset + data.len() > self.state.runtime.large_blobs.expected_length {
+            return Err(Error::InvalidParameter);
+        }
+
+        // 7.-11. Write the buffer
+        info!("Writing large-blob array to offset {offset}");
+        large_blobs::write_chunk(
+            &mut self.trussed,
+            &mut self.state.runtime.large_blobs,
+            config.location,
+            data,
+        )?;
+
+        Ok(ctap2::large_blobs::Response::default())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SupportedAttestationFormat {
+    None,
+    Packed,
+}
+
+impl SupportedAttestationFormat {
+    fn select(preference: &AttestationFormatsPreference) -> Option<Self> {
+        if preference.known_formats() == [AttestationStatementFormat::None]
+            && !preference.includes_unknown_formats()
+        {
+            // platform requested only None --> omit attestation statement
+            return None;
+        }
+        // use first known and supported format, or default to packed format
+        let format = preference
+            .known_formats()
+            .iter()
+            .copied()
+            .flat_map(Self::try_from)
+            .next()
+            .unwrap_or(Self::Packed);
+        Some(format)
+    }
+}
+
+impl From<SupportedAttestationFormat> for AttestationStatementFormat {
+    fn from(format: SupportedAttestationFormat) -> Self {
+        match format {
+            SupportedAttestationFormat::None => Self::None,
+            SupportedAttestationFormat::Packed => Self::Packed,
+        }
+    }
+}
+
+impl TryFrom<AttestationStatementFormat> for SupportedAttestationFormat {
+    type Error = Error;
+
+    fn try_from(format: AttestationStatementFormat) -> core::result::Result<Self, Self::Error> {
+        match format {
+            AttestationStatementFormat::None => Ok(Self::None),
+            AttestationStatementFormat::Packed => Ok(Self::Packed),
+            _ => Err(Error::Other),
+        }
+    }
+}
+
+// The new path scheme for disvoerable credentials (= resident keys) is:
+//   rk/<rp_id_hash>.<credential_id_hash>
+// The hashes are truncated to the first eight bytes and formatted as hex strings.
+// We use the following terms for the components:
+//   rk_path:              rk/<rp_id_hash>.<credential_id_hash>
+//   rp_file_name_prefix:  <rp_id_hash>
+
+fn rp_file_name_prefix(rp_id_hash: &[u8; 32]) -> PathBuf {
+    let mut hex = [b'0'; 16];
+    super::format_hex(&rp_id_hash[..8], &mut hex);
+    PathBuf::try_from(&hex).unwrap()
+}
+
+fn rk_path(rp_id_hash: &[u8; 32], credential_id_hash: &[u8; 32]) -> PathBuf {
+    // 16 bytes per hash + dot + trailing zero = 34
+    let mut buf = [0; 34];
+    buf[16] = b'.';
+    format_hex(&rp_id_hash[..8], &mut buf[..16]);
+    format_hex(&credential_id_hash[..8], &mut buf[17..33]);
+
+    let mut path = PathBuf::from(RK_DIR);
+    path.push(Path::from_bytes_with_nul(&buf).unwrap());
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rk_path, rp_file_name_prefix};
+
+    const TEST_HASH: &[u8; 32] = &[
+        134, 54, 157, 96, 10, 28, 233, 79, 219, 59, 195, 125, 165, 251, 120, 14, 49, 152, 212, 191,
+        114, 137, 180, 207, 255, 177, 187, 106, 173, 1, 203, 171,
+    ];
+    const TEST_HASH_HEX: &str = "86369d600a1ce94f";
+
+    #[test]
+    fn test_rp_file_name_prefix() {
+        assert_eq!(rp_file_name_prefix(&[0; 32]).as_str(), "0000000000000000");
+        assert_eq!(rp_file_name_prefix(TEST_HASH).as_str(), TEST_HASH_HEX);
+    }
+
+    #[test]
+    fn test_rk_path() {
+        fn test(rp_id_hash: &[u8; 32], credential_id_hash: &[u8; 32], expected: &str) {
+            println!("rp_id_hash: {rp_id_hash:?}");
+            println!("credential_id_hash: {credential_id_hash:?}");
+            let actual = rk_path(rp_id_hash, credential_id_hash);
+            assert_eq!(actual.as_str(), expected);
+        }
+
+        let input_zero = &[0; 32];
+        let output_zero = "0000000000000000";
+        let input_nonzero = TEST_HASH;
+        let output_nonzero = TEST_HASH_HEX;
+
+        test(
+            input_zero,
+            input_zero,
+            &format!("rk/{output_zero}.{output_zero}"),
+        );
+        test(
+            input_zero,
+            input_nonzero,
+            &format!("rk/{output_zero}.{output_nonzero}"),
+        );
+        test(
+            input_nonzero,
+            input_zero,
+            &format!("rk/{output_nonzero}.{output_zero}"),
+        );
+        test(
+            input_nonzero,
+            input_nonzero,
+            &format!("rk/{output_nonzero}.{output_nonzero}"),
+        );
+    }
+}

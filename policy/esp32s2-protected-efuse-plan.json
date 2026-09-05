@@ -1,0 +1,364 @@
+{
+  "approval": {
+    "approved": false,
+    "note": "Source review and read-only validation do not authorize an eFuse write.",
+    "required_immediately_before_each_irreversible_stage": true
+  },
+  "key_slots": [
+    {
+      "block": "BLOCK_KEY0",
+      "bytes": 32,
+      "input": "unique-per-device-flash-encryption-key",
+      "purpose": "XTS_AES_128_KEY",
+      "read_protect": true,
+      "secret": true,
+      "write_protect": true
+    },
+    {
+      "block": "BLOCK_KEY1",
+      "bytes": 32,
+      "input": "rsa3072-secure-boot-public-key-digest",
+      "purpose": "SECURE_BOOT_DIGEST0",
+      "read_protect": false,
+      "secret": false,
+      "write_protect": true
+    }
+  ],
+  "kind": "rissokey-esp32s2-protected-efuse-plan",
+  "readback_profiles": {
+    "pristine": {
+      "BLOCK_KEY0": {
+        "raw_value": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "readable": true,
+        "writeable": true
+      },
+      "BLOCK_KEY1": {
+        "raw_value": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "readable": true,
+        "writeable": true
+      },
+      "DIS_BOOT_REMAP": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_DCACHE": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_DOWNLOAD_DCACHE": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_DOWNLOAD_ICACHE": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_DOWNLOAD_MANUAL_ENCRYPT": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_DOWNLOAD_MODE": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_FORCE_DOWNLOAD": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_ICACHE": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_LEGACY_SPI_BOOT": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_USB": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_USB_DOWNLOAD_MODE": {
+        "value": false,
+        "writeable": true
+      },
+      "ENABLE_SECURITY_DOWNLOAD": {
+        "value": false,
+        "writeable": true
+      },
+      "HARD_DIS_JTAG": {
+        "value": false,
+        "writeable": true
+      },
+      "KEY_PURPOSE_0": {
+        "value": "USER",
+        "writeable": true
+      },
+      "KEY_PURPOSE_1": {
+        "value": "USER",
+        "writeable": true
+      },
+      "RD_DIS": {
+        "raw_value": "0x00",
+        "writeable": true
+      },
+      "SECURE_BOOT_AGGRESSIVE_REVOKE": {
+        "value": false,
+        "writeable": true
+      },
+      "SECURE_BOOT_EN": {
+        "value": false,
+        "writeable": true
+      },
+      "SECURE_BOOT_KEY_REVOKE0": {
+        "value": false,
+        "writeable": true
+      },
+      "SECURE_BOOT_KEY_REVOKE1": {
+        "value": false,
+        "writeable": true
+      },
+      "SECURE_BOOT_KEY_REVOKE2": {
+        "value": false,
+        "writeable": true
+      },
+      "SOFT_DIS_JTAG": {
+        "value": false,
+        "writeable": true
+      },
+      "SPI_BOOT_CRYPT_CNT": {
+        "raw_value": "0x0",
+        "writeable": true
+      }
+    },
+    "provisioned_before_rom_lockdown": {
+      "BLOCK_KEY0": {
+        "raw_value": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "readable": false,
+        "writeable": false
+      },
+      "BLOCK_KEY1": {
+        "readable": true,
+        "writeable": false
+      },
+      "DIS_BOOT_REMAP": {
+        "value": true,
+        "writeable": false
+      },
+      "DIS_DCACHE": {
+        "value": false,
+        "writeable": false
+      },
+      "DIS_DOWNLOAD_DCACHE": {
+        "value": true,
+        "writeable": false
+      },
+      "DIS_DOWNLOAD_ICACHE": {
+        "value": true,
+        "writeable": false
+      },
+      "DIS_DOWNLOAD_MANUAL_ENCRYPT": {
+        "value": true,
+        "writeable": false
+      },
+      "DIS_DOWNLOAD_MODE": {
+        "value": false,
+        "writeable": true
+      },
+      "DIS_FORCE_DOWNLOAD": {
+        "value": false,
+        "writeable": false
+      },
+      "DIS_ICACHE": {
+        "value": false,
+        "writeable": false
+      },
+      "DIS_LEGACY_SPI_BOOT": {
+        "value": true
+      },
+      "DIS_USB": {
+        "value": false,
+        "writeable": false
+      },
+      "DIS_USB_DOWNLOAD_MODE": {
+        "value": false,
+        "writeable": true
+      },
+      "ENABLE_SECURITY_DOWNLOAD": {
+        "value": false,
+        "writeable": true
+      },
+      "HARD_DIS_JTAG": {
+        "value": true,
+        "writeable": false
+      },
+      "KEY_PURPOSE_0": {
+        "value": "XTS_AES_128_KEY",
+        "writeable": false
+      },
+      "KEY_PURPOSE_1": {
+        "value": "SECURE_BOOT_DIGEST0",
+        "writeable": false
+      },
+      "RD_DIS": {
+        "raw_value": "0x01",
+        "writeable": false
+      },
+      "SECURE_BOOT_AGGRESSIVE_REVOKE": {
+        "value": false
+      },
+      "SECURE_BOOT_EN": {
+        "value": true
+      },
+      "SECURE_BOOT_KEY_REVOKE0": {
+        "value": false
+      },
+      "SECURE_BOOT_KEY_REVOKE1": {
+        "value": true
+      },
+      "SECURE_BOOT_KEY_REVOKE2": {
+        "value": true
+      },
+      "SOFT_DIS_JTAG": {
+        "value": true,
+        "writeable": false
+      },
+      "SPI_BOOT_CRYPT_CNT": {
+        "raw_value": "0x7",
+        "writeable": true
+      }
+    }
+  },
+  "schema": 1,
+  "stages": [
+    {
+      "id": "host-package",
+      "irreversible": false,
+      "requires": [
+        "clean-source-tree",
+        "pinned-toolchain",
+        "signed-bootloader-and-apps-verified-with-public-key",
+        "all-required-regions-encrypted-for-their-final-offsets",
+        "hash-bound-recovery-package-outside-git"
+      ]
+    },
+    {
+      "id": "flash-encryption",
+      "irreversible": true,
+      "operations": [
+        {
+          "block": "BLOCK_KEY0",
+          "purpose": "XTS_AES_128_KEY",
+          "type": "burn-key"
+        },
+        {
+          "fields": {
+            "DIS_BOOT_REMAP": 1,
+            "DIS_DOWNLOAD_DCACHE": 1,
+            "DIS_DOWNLOAD_ICACHE": 1,
+            "DIS_DOWNLOAD_MANUAL_ENCRYPT": 1,
+            "DIS_LEGACY_SPI_BOOT": 1,
+            "HARD_DIS_JTAG": 1,
+            "SOFT_DIS_JTAG": 1,
+            "SPI_BOOT_CRYPT_CNT": 7
+          },
+          "type": "burn-fields"
+        },
+        {
+          "field": "DIS_ICACHE",
+          "type": "write-protect-shared-security-group"
+        }
+      ],
+      "requires": [
+        "fresh-pristine-readback-match",
+        "erased-disposable-target",
+        "stable-power",
+        "explicit-immediate-user-authorization"
+      ]
+    },
+    {
+      "id": "ciphertext-install",
+      "irreversible": false,
+      "requires": [
+        "exact-offset-ciphertext-write",
+        "raw-ciphertext-readback-match-before-secure-boot"
+      ]
+    },
+    {
+      "id": "secure-boot-v2",
+      "irreversible": true,
+      "operations": [
+        {
+          "block": "BLOCK_KEY1",
+          "purpose": "SECURE_BOOT_DIGEST0",
+          "type": "burn-key"
+        },
+        {
+          "fields": {
+            "SECURE_BOOT_EN": 1,
+            "SECURE_BOOT_KEY_REVOKE1": 1,
+            "SECURE_BOOT_KEY_REVOKE2": 1
+          },
+          "type": "burn-fields"
+        },
+        {
+          "field": "RD_DIS",
+          "type": "write-protect"
+        }
+      ],
+      "requires": [
+        "ciphertext-readback-match",
+        "secure-boot-digest-matches-signed-images",
+        "explicit-immediate-user-authorization"
+      ]
+    },
+    {
+      "id": "protected-acceptance",
+      "irreversible": false,
+      "requires": [
+        "encrypted-boot-and-usb-fido",
+        "signed-ab-success-and-rollback",
+        "fresh-encrypted-store-provisioning",
+        "credential-persistence-after-power-cycle",
+        "signed-encrypted-rom-recovery",
+        "provisioned-before-rom-lockdown-readback-match"
+      ]
+    },
+    {
+      "id": "rom-lockdown",
+      "irreversible": true,
+      "note": "Secure Download Mode is restricted maintenance, not complete closure. No final burn sequence is approved. See docs/plans/esp32s2-hardening.md.",
+      "operations": [],
+      "requires": [
+        "all-protected-acceptance-gates-passed",
+        "exact-chip-revision-and-current-identity-reverified",
+        "final-rom-policy-selected",
+        "both-valid-ota-slots-and-recovery-policy-tested-on-separate-device",
+        "anti-rollback-floor-and-shared-write-protection-reviewed",
+        "offline-backup-copy-restore-verified",
+        "final-full-efuse-readback-captured-outside-git",
+        "explicit-immediate-user-authorization"
+      ],
+      "status": "blocked-pending-recovery-and-anti-rollback-design"
+    },
+    {
+      "id": "finalize",
+      "irreversible": false,
+      "requires": [
+        "selected-rom-policy-and-signed-usb-update-verified",
+        "separate-flash-key-retention-decision",
+        "no-secret-or-device-identifier-in-git-or-public-evidence"
+      ]
+    }
+  ],
+  "status": "draft-unapproved",
+  "target": {
+    "board": "WEMOS S2 Mini",
+    "chip": "esp32s2",
+    "esp_idf_commit": "fff9895c82d744c7237be8847347bdd1b07c6643",
+    "esp_idf_version": "6.1",
+    "esptool_version": "5.4.0",
+    "flash_bytes": 4194304,
+    "flash_encryption": "AES-128-XTS-256-bit-key",
+    "secure_boot": "v2-rsa3072"
+  }
+}

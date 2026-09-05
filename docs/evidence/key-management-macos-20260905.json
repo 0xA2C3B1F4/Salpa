@@ -1,0 +1,36 @@
+{
+  "backend_source_sha256": "7428227a7d281dc3a6da27e19b74ade43dd65b430200b6cab6fd0b0cdcc532a9",
+  "backup": {
+    "encrypted_signing_backup_created": true,
+    "flash_key_included": false,
+    "fresh_process_in_memory_restore_passed": true,
+    "new_mac_keychain_import_tested": false,
+    "restored_public_root_and_sign_verify_passed": true,
+    "offline_medium_restore_included_in_this_test": false
+  },
+  "crypto": {
+    "aes_xts_reference_vectors": 6,
+    "backup_pbkdf2_reference_and_gcm_negative_tests_passed": true,
+    "ciphertext_matches_existing_protected_package": true,
+    "espsecure_version": "5.4.0",
+    "existing_device_public_root_unchanged": true,
+    "rsa_pss_sha256_salt32_independently_verified": true
+  },
+  "hardware_operations_performed": false,
+  "helper_source_sha256": "e8f07fb7074dddc377286d994206d9bf14b048090cf74fd487a8de2789d8b5a6",
+  "keychain": {
+    "hardened_runtime": true,
+    "implementation": "local login file Keychain",
+    "interactive_signing_and_encryption_passed": true,
+    "mandatory_fresh_LAContext_owner_authentication": true,
+    "noninteractive_read_denied_for_helper_and_unrelated_executable": true,
+    "separate_signing_and_flash_records": true,
+    "synchronizable": false,
+    "trusted_application_lists_empty": true
+  },
+  "kind": "rissokey-local-key-management-host-validation",
+  "macos": "26.5.2",
+  "physical_device_acceptance_implied": false,
+  "schema": 1,
+  "verified_at": "2026-09-05T04:55:36.187196+00:00"
+}

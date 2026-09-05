@@ -1,0 +1,22 @@
+#!/bin/sh
+
+set -eu
+
+: "${TMPDIR:?TMPDIR must point to a temporary-file directory}"
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repository=$(dirname -- "$script_dir")
+manifest="$repository/tests/persistent-state/Cargo.toml"
+target_dir=${CARGO_TARGET_DIR:-"${TMPDIR%/}/rissokey-persistent-state-target"}
+
+cd "$TMPDIR"
+host_target=$(rustc -vV | sed -n 's/^host: //p')
+if [ -z "$host_target" ]; then
+    echo "could not determine the Rust host target" >&2
+    exit 1
+fi
+
+RUSTFLAGS= CARGO_TARGET_DIR="$target_dir" cargo test \
+    --manifest-path "$manifest" \
+    --target "$host_target" \
+    --locked

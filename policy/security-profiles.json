@@ -1,0 +1,252 @@
+{
+  "profiles": {
+    "wemos-s2-mini-development": {
+      "artifact_recording_allowed": true,
+      "blocking_conditions": [
+        "Credential flash is not encrypted.",
+        "GPIO0 is both user presence and a boot strapping input.",
+        "JTAG and ROM download access remain available.",
+        "Secure Boot V2 is not enforced."
+      ],
+      "board": "WEMOS S2 Mini",
+      "cargo_features": {
+        "forbidden": [
+          "development-provisioning",
+          "firmware-diagnostics",
+          "non-strapping-user-presence",
+          "physical-storage-fault-test",
+          "release-flash-encryption",
+          "signed-ab-failure-test",
+          "signed-ab-success-test",
+          "signed-ab-update",
+          "storage-provisioning"
+        ],
+        "required": [
+          "ctaphid-bringup",
+          "fido-stack",
+          "mcu-esp32s2"
+        ]
+      },
+      "mcu": "esp32s2",
+      "release_eligible": false,
+      "security": {
+        "debug_access": "enabled",
+        "flash_encryption": "disabled",
+        "rom_download": "enabled",
+        "secure_boot": "disabled"
+      },
+      "status": "development",
+      "user_presence": {
+        "active_level": "low",
+        "boot_strapping_input": true,
+        "gpio": 0
+      }
+    },
+    "wemos-s2-mini-e000-migration-test": {
+      "artifact_recording_allowed": false,
+      "blocking_conditions": [
+        "Credential flash is not encrypted.",
+        "GPIO0 is both user presence and a boot strapping input.",
+        "Secure Boot V2 is not enforced."
+      ],
+      "board": "WEMOS S2 Mini",
+      "cargo_features": {
+        "forbidden": [
+          "development-provisioning",
+          "firmware-diagnostics",
+          "non-strapping-user-presence",
+          "physical-storage-fault-test",
+          "release-flash-encryption",
+          "signed-ab-failure-test",
+          "signed-ab-success-test",
+          "signed-ab-update",
+          "storage-provisioning"
+        ],
+        "required": [
+          "ctaphid-bringup",
+          "fido-stack",
+          "mcu-esp32s2"
+        ]
+      },
+      "mcu": "esp32s2",
+      "release_eligible": false,
+      "security": {
+        "debug_access": "enabled",
+        "flash_encryption": "disabled",
+        "rom_download": "enabled",
+        "secure_boot": "disabled"
+      },
+      "status": "device-test-passed",
+      "user_presence": {
+        "active_level": "low",
+        "boot_strapping_input": true,
+        "gpio": 0
+      }
+    },
+    "wemos-s2-mini-non-strapping-up-test": {
+      "artifact_recording_allowed": false,
+      "blocking_conditions": [
+        "Credential flash is not encrypted.",
+        "Hardware Secure Boot V2 is not enforced."
+      ],
+      "board": "WEMOS S2 Mini",
+      "cargo_features": {
+        "forbidden": [
+          "development-provisioning",
+          "firmware-diagnostics",
+          "physical-storage-fault-test",
+          "release-flash-encryption",
+          "signed-ab-failure-test",
+          "signed-ab-success-test",
+          "storage-provisioning"
+        ],
+        "required": [
+          "ctaphid-bringup",
+          "fido-stack",
+          "mcu-esp32s2",
+          "non-strapping-user-presence",
+          "signed-ab-update"
+        ]
+      },
+      "mcu": "esp32s2",
+      "release_eligible": false,
+      "security": {
+        "debug_access": "enabled",
+        "flash_encryption": "disabled",
+        "rom_download": "enabled",
+        "secure_boot": "development-key-pinned-bootloader-without-efuse"
+      },
+      "status": "device-test-passed",
+      "user_presence": {
+        "active_level": "low",
+        "boot_strapping_input": false,
+        "gpio": 16
+      }
+    },
+    "wemos-s2-mini-protected-prototype": {
+      "artifact_recording_allowed": false,
+      "blocking_conditions": [
+        "Final ROM download policy has not been authorized or applied.",
+        "Independent security review and physical attack evaluation remain incomplete.",
+        "Production identity provisioning and support requirements remain incomplete."
+      ],
+      "board": "WEMOS S2 Mini",
+      "cargo_features": {
+        "forbidden": [
+          "attestation-import",
+          "development-provisioning",
+          "firmware-diagnostics",
+          "physical-storage-fault-test",
+          "signed-ab-failure-test",
+          "signed-ab-success-test",
+          "storage-provisioning"
+        ],
+        "required": [
+          "ctaphid-bringup",
+          "fido-stack",
+          "mcu-esp32s2",
+          "non-strapping-user-presence",
+          "release-flash-encryption",
+          "signed-ab-update",
+          "usb-signed-update"
+        ]
+      },
+      "mcu": "esp32s2",
+      "release_eligible": false,
+      "security": {
+        "debug_access": "required-disabled",
+        "flash_encryption": "required-release-mode",
+        "rom_download": "must-use-approved-recovery-policy",
+        "secure_boot": "required-v2-rsa"
+      },
+      "status": "prototype-accepted-release-blocked",
+      "user_presence": {
+        "active_level": "low",
+        "boot_strapping_input": false,
+        "gpio": 16
+      }
+    },
+    "wemos-s2-mini-secure-boot-v2-build-spike": {
+      "artifact_recording_allowed": false,
+      "blocking_conditions": [
+        "Booting this configuration can irreversibly change eFuses.",
+        "Flash encryption and encrypted credential storage are not included.",
+        "The bootloader is build-only and must not be flashed.",
+        "The partition table must move from 0x8000 to 0xE000 for the larger bootloader."
+      ],
+      "board": "WEMOS S2 Mini",
+      "cargo_features": {
+        "forbidden": [
+          "development-provisioning",
+          "firmware-diagnostics",
+          "non-strapping-user-presence",
+          "physical-storage-fault-test",
+          "release-flash-encryption",
+          "signed-ab-failure-test",
+          "signed-ab-success-test",
+          "signed-ab-update",
+          "storage-provisioning"
+        ],
+        "required": [
+          "ctaphid-bringup",
+          "fido-stack",
+          "mcu-esp32s2"
+        ]
+      },
+      "mcu": "esp32s2",
+      "release_eligible": false,
+      "security": {
+        "debug_access": "would-be-disabled-on-first-boot",
+        "flash_encryption": "disabled",
+        "rom_download": "would-switch-to-secure-mode-on-first-boot",
+        "secure_boot": "configured-v2-rsa-build-only"
+      },
+      "status": "host-build-spike",
+      "user_presence": {
+        "active_level": "low",
+        "boot_strapping_input": true,
+        "gpio": 0
+      }
+    },
+    "wemos-s2-mini-signed-ab-test": {
+      "artifact_recording_allowed": false,
+      "blocking_conditions": [
+        "Credential flash is not encrypted.",
+        "GPIO0 is both user presence and a boot strapping input.",
+        "Hardware Secure Boot V2 is not enforced."
+      ],
+      "board": "WEMOS S2 Mini",
+      "cargo_features": {
+        "forbidden": [
+          "development-provisioning",
+          "firmware-diagnostics",
+          "non-strapping-user-presence",
+          "physical-storage-fault-test",
+          "release-flash-encryption",
+          "storage-provisioning"
+        ],
+        "required": [
+          "ctaphid-bringup",
+          "fido-stack",
+          "mcu-esp32s2",
+          "signed-ab-update"
+        ]
+      },
+      "mcu": "esp32s2",
+      "release_eligible": false,
+      "security": {
+        "debug_access": "enabled",
+        "flash_encryption": "disabled",
+        "rom_download": "enabled",
+        "secure_boot": "development-key-pinned-bootloader-without-efuse"
+      },
+      "status": "device-test-passed",
+      "user_presence": {
+        "active_level": "low",
+        "boot_strapping_input": true,
+        "gpio": 0
+      }
+    }
+  },
+  "schema": 1
+}
