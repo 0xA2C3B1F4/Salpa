@@ -1,5 +1,5 @@
 # Maintained direct dependencies. Regenerate requirements-dev.txt with hashes.
 # See docs/development/python-dependencies.md.
-cryptography==48.0.1
+cryptography==50.0.1
 esptool==5.4.0
 fido2==2.2.1
