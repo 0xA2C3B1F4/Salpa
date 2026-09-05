@@ -1,0 +1,6 @@
+# Reversible migration layout for a bootloader that reads the table at 0xE000.
+# Name,       Type, SubType, Offset,   Size,     Flags
+factory,      app,  factory,  0x10000,  0x3c0000,
+nvs,          data, nvs,      0x3d0000, 0x6000,
+phy_init,     data, phy,      0x3d6000, 0x1000,
+fido_store,   data, littlefs, 0x3e0000, 0x20000,

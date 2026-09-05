@@ -1,0 +1,106 @@
+{
+  "schema": 1,
+  "kind": "protected-esp32s2-usb-update-acceptance",
+  "updated_at": "2026-09-05T08:24:22.052395+00:00",
+  "metadata_preparation_source_commit": "2b63516",
+  "runtime_source_commit": "ef2001b",
+  "initial_metadata_installation": {
+    "identity_matches": true,
+    "fresh_raw_erased_metadata_rechecked": true,
+    "known_good_runtime_verified_before_initialization": true,
+    "offset": 61440,
+    "written_bytes": 8192,
+    "complete_ciphertext_readback_matches": true,
+    "credential_store_unchanged": true,
+    "adjacent_sectors_unchanged": true,
+    "reset_performed": false,
+    "efuse_operations_performed": false
+  },
+  "pre_initialization_fido_gates": {
+    "expected_attestation_verified": true,
+    "test_credential_created": true,
+    "assertion_passed": true,
+    "assertion_after_usb_power_cycle_passed": true
+  },
+  "post_initialization_fido": {
+    "usb_init_ping_getinfo_passed": true,
+    "original_test_credential_assertion_passed": true
+  },
+  "signed_usb_update": {
+    "installation_passed": true,
+    "signed_image_bytes": 413696,
+    "target_slot": 1,
+    "verified_and_activated_phase": 4,
+    "image_sha256": "283c0c044100681a807c3a0ff51c5e91b74a2a0343809d341089be71e7f772dd",
+    "fresh_gpio16_approval": true,
+    "first_boot": "FIDO INIT, fragmented PING and GetInfo passed",
+    "credential_persistence": "existing test credential assertion verified after update",
+    "subsequent_update_accepted_valid_active_entry": true
+  },
+  "rollback": {
+    "fixture_installation_passed": true,
+    "target_slot": 0,
+    "fixture_image_sha256": "effc120c149377341943a7b4141fa9a2f62d4ca2a419f181cc24e869a606295a",
+    "fixture_first_boot_version": "0.1.1-ab-fail",
+    "after_reset_version": "0.1.0",
+    "normal_fido_after_rollback_passed": true,
+    "credential_persistence": "original test credential assertion verified after rollback",
+    "boot_metadata_raw_confirmation": {
+      "encrypted_entry0_matches_sequence3_aborted": true,
+      "encrypted_entry1_matches_sequence2_valid": true,
+      "active_slot": 1,
+      "raw_sector_padding_erased": true
+    }
+  },
+  "encrypted_recovery": {
+    "captured_at": "2026-09-05T08:21:09.388999+00:00",
+    "same_device_verified": true,
+    "all_efuses_unchanged": true,
+    "boot_metadata": {
+      "entry0_sequence": 3,
+      "entry0_state": "ABORTED",
+      "entry1_sequence": 2,
+      "entry1_state": "VALID",
+      "selected_slot": 1,
+      "encrypted_reference_matches": true
+    },
+    "all_installed_images_matched_recovery_package_before_write": true,
+    "writes": [
+      {
+        "component": "bootloader",
+        "offset": 4096,
+        "bytes": 49152,
+        "entire_ciphertext_readback_matches": true
+      },
+      {
+        "component": "partition_table",
+        "offset": 57344,
+        "bytes": 3072,
+        "entire_ciphertext_readback_matches": true
+      },
+      {
+        "component": "runtime_ota1",
+        "offset": 2097152,
+        "bytes": 413696,
+        "entire_ciphertext_readback_matches": true
+      }
+    ],
+    "otadata_preserved": true,
+    "credential_store_preserved": true,
+    "inactive_slot_header_preserved": true,
+    "existing_trust_root_preserved": true,
+    "reset_performed": false,
+    "efuse_operations_performed": false,
+    "post_recovery_fido": {
+      "normal_boot_usb_init_ping_getinfo_passed": true,
+      "original_test_credential_assertion_verified": true
+    }
+  },
+  "existing_signing_and_flash_keys_preserved": true,
+  "efuse_operations_performed": false,
+  "private_evidence": "Full encrypted readbacks and operation logs retained outside the repository; no private device identifiers included",
+  "all_efuses_match_established_baseline_after_rollback": true,
+  "final_device_mode": "normal FIDO runtime",
+  "all_requested_protected_device_acceptance_gates_passed": true,
+  "openai_interoperability_test_performed": false
+}

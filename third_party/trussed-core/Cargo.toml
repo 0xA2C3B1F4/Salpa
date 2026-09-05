@@ -1,0 +1,59 @@
+[package]
+name = "trussed-core"
+version = "0.2.2"
+description = "Core types for the trussed crate"
+authors = [
+    "The Trussed developers",
+    "Nicolas Stalder <n@stalder.io>",
+    "Nitrokey GmbH",
+]
+edition = "2021"
+homepage = "https://trussed.dev"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/trussed-dev/trussed"
+
+[dependencies]
+heapless-bytes = "0.5"
+littlefs2-core = { version = "0.1", features = ["serde"] }
+portable-atomic = { version = "1", default-features = false, features = ["require-cas"] }
+postcard = "0.7.0"
+rand_core = "0.6"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde-indexed = "0.1"
+
+[features]
+serde-extensions = []
+
+attestation-client = []
+certificate-client = []
+crypto-client = []
+counter-client = []
+filesystem-client = []
+management-client = []
+ui-client = []
+
+aes256-cbc = []
+aes256-gcm = []
+brainpoolp256r1 = []
+brainpoolp384r1 = []
+brainpoolp512r1 = []
+chacha8-poly1305 = []
+ed255 = []
+hmac-blake2s = []
+hmac-sha1 = []
+hmac-sha256 = []
+hmac-sha512 = []
+mldsa44 = []
+p256 = []
+p384 = []
+p521 = []
+rsa2048 = []
+rsa3072 = []
+rsa4096 = []
+secp256k1 = []
+sha256 = []
+shared-secret = []
+tdes = []
+totp = []
+trng = []
+x255 = []

@@ -1,0 +1,122 @@
+{
+  "schema": 1,
+  "kind": "esp32s2-encrypted-drom-provisioning-diagnosis",
+  "source_commit": "ef2001b2c9f11a10ef7fd7be6c03a235ad8c4760",
+  "host_unit_tests": {
+    "passed": 70,
+    "failed": 0
+  },
+  "security_profiles_passed": 6,
+  "partition_layouts_passed": true,
+  "builds": [
+    "storage-provisioner",
+    "normal-runtime",
+    "rollback-failure-runtime"
+  ],
+  "cache_disabled_execution_verified": {
+    "method": "Inspect final Xtensa disassembly; direct three ROM calls from RAM; literals in RAM",
+    "provisioner_helper_address": "0x400251d0",
+    "normal_runtime_helper_address": "Recorded for earlier IBus-only build; final runtime source uses the same RAM helper with flash bit15"
+  },
+  "prior_provisioning_observation": {
+    "steady_led_reported": true,
+    "raw_fido_store_completely_erased": true,
+    "rtc_record_valid_after_en_reset": false,
+    "rtc_result_interpreted": false
+  },
+  "pre_install_checks": {
+    "same_device": true,
+    "all_efuses_unchanged": true,
+    "fido_store_completely_erased": true,
+    "otadata_completely_erased": true
+  },
+  "corrected_provisioner_install": {
+    "write_offset": 131072,
+    "verified_bytes": 110592,
+    "exact_ciphertext_readback_match": true,
+    "efuse_operations_performed": false,
+    "reset_performed": false
+  },
+  "corrected_provisioner_artifacts": {
+    "provisioner-unsigned.bin": {
+      "size": 104192,
+      "sha256": "989975b3d0a883f1eae6760d5b19b4caa2d3a6172742ad24e7969eeee6725dd8"
+    },
+    "provisioner-signed.bin": {
+      "size": 110592,
+      "sha256": "b3a69e5ad01eb3c4278e6d89ad8eba42291a9934f86b716399219984eb3ae472"
+    },
+    "provisioner-ota0-encrypted.bin": {
+      "size": 110592,
+      "sha256": "bec63664cd9f05c08cc0cd1d617549604409480db82c6dc05aec7e4ecb6c81ae"
+    }
+  },
+  "physical_gates": {
+    "corrected_provisioning": {
+      "user_observed_success_pulses": 2,
+      "encrypted_public_pattern_roundtrip_passed": true,
+      "format_mount_and_both_markers_passed": true,
+      "raw_readback_changed_from_erased": true,
+      "all_efuses_unchanged": true
+    },
+    "normal_runtime": {
+      "installation": {
+        "runtime_write_offset": 131072,
+        "runtime_verified_bytes": 413696,
+        "runtime_ciphertext_sha256": "68cb7d1e07aa5b8221fb783d6e220497c452058d122fd1e189f8a16eb1f129c6",
+        "entire_written_image_readback_matches": true,
+        "fido_store_preserved": true,
+        "otadata_preserved": true,
+        "reset_performed": false,
+        "efuse_operations_performed": false
+      },
+      "usb_fido": "passed after explicitly authorized replacement attestation import",
+      "owner_reset_and_power_cycle_observed": {
+        "reset_reported": true,
+        "usb_power_cycle_reported": true,
+        "led_remained_dark": true
+      },
+      "initial_usb_fido_observation": "not enumerated after owner reset and USB power cycle"
+    },
+    "credential_persistence": "passed after authorized replacement attestation import and USB power cycle",
+    "signed_usb_update": "passed; complete on-device image verification, activation, subsequent FIDO and existing credential assertion",
+    "rollback": "passed; failure fixture booted, reset restored normal runtime, existing credential assertion passed; encrypted metadata confirms ABORTED/VALID entries",
+    "encrypted_recovery": "passed; full bootloader, partition table and active ota_1 written and read back; otadata, encrypted credential store and eFuses unchanged; final FIDO and existing credential assertion passed"
+  },
+  "existing_keychain_keys_used": true,
+  "new_production_keys_generated": false,
+  "efuse_operations_performed": false,
+  "key_deletions_performed": false,
+  "private_evidence": "Retained in task-owned external scratch; no raw device identifiers or storage dumps included",
+  "final_mapping_source_commit": "ef2001b2c9f11a10ef7fd7be6c03a235ad8c4760",
+  "second_mapping_defect": "ESP32-S2 MMU flash target flag bit15 was missing",
+  "host_ciphertext_probe_comparison": {
+    "first_written_32_byte_block_matches_keychain_reference": true,
+    "decrypted_readback_before_flag_correction_failed": true
+  },
+  "initial_ibus_correction_source_commit": "aeec83d9df9822a61c70a9cae738aef0e5b57e71",
+  "recovery_package_prepared": true,
+  "current_checkpoint": "Second-device protected acceptance passed: encrypted storage, owner-authorized replacement attestation, credential power-cycle persistence, initial OTA metadata, signed USB update, rollback and encrypted ROM recovery. Existing credential verified after final recovery; firmware signing root, flash key and eFuses preserved.",
+  "attestation_recovery": {
+    "storage_provisioner_installs_attestation": false,
+    "runtime_requires_existing_attestation_before_usb_polling": true,
+    "original_pair_found": false,
+    "original_directory_deletion_confirmed_in_prior_task_history": true,
+    "original_certificate_reference_recovered_privately": true,
+    "examined_flash_backups_contain_erased_fido_store": true,
+    "time_machine_backups_checked": false,
+    "time_machine_check_limitation": "macOS denied backup enumeration",
+    "original_pair_validator_tests_passed": 9,
+    "replacement_device_identity_generated": true,
+    "runtime_attestation_verification_bypassed": false,
+    "exact_device_halt_location_observed": false,
+    "diagnosis": "Fresh storage lacks mandatory original attestation; source proves this blocks USB polling, but no device trace confirms the precise halt location",
+    "replacement_explicitly_authorized_for_second_device": true,
+    "followup_evidence": "attestation-import-esp32s2-20260905.json"
+  },
+  "followup_host_python_tests": {
+    "passed": 22,
+    "failed": 0
+  },
+  "protected_update_followup_evidence": "protected-ota-esp32s2-20260905.json"
+}

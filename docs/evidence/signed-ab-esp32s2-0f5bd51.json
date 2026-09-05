@@ -1,0 +1,56 @@
+{
+  "accepted_on": "2026-09-04",
+  "device": {
+    "flash_size_bytes": 4194304,
+    "target": "esp32s2"
+  },
+  "development_trust_anchor_only": true,
+  "efuse_operations_performed": false,
+  "final_state": {
+    "active_slot": 1,
+    "ota_0": {
+      "sequence": 3,
+      "state": "aborted"
+    },
+    "ota_1": {
+      "sequence": 2,
+      "state": "valid"
+    }
+  },
+  "gates": {
+    "base_ctap2_firmware_version": 64,
+    "credential_store_preserved_during_all_writes": true,
+    "failure_image_booted_once": true,
+    "failure_image_rolled_back": true,
+    "success_ctap2_firmware_version": 66,
+    "success_image_persisted_across_reset": true,
+    "transport_checks": [
+      "ctaphid_init",
+      "fragmented_80_byte_ping",
+      "authenticator_get_info"
+    ],
+    "untrusted_image_rejected": true
+  },
+  "kind": "rissokey-signed-ab-physical-acceptance",
+  "package_manifest_sha256": "a43d270ac243fe43fe7e55dc5ce89214c7cf02f52b5d7f7d0cff3717be0ffb84",
+  "raw_evidence_sha256": {
+    "01-install/installed.json": "8949b2f09ed74182b8926ab1ab27f15427aa81bc35cfe984107af31f116381d0",
+    "02-base-valid/status.json": "9707173186a9714eeb2d404bed6296676a27c7e2be33c39a7b62ff767e37d398",
+    "03-stage-failure/staged.json": "5027b79a1011d835520d04326630e408f2315ecd44bfc5b7c8f89906d58475cf",
+    "04-failure-rollback/status.json": "082bde35a73a679e36a8c2be69f55659915ce12c20a29e1f22f957fef67e0418",
+    "05-stage-success/staged.json": "5835b17b0c1c6bc9a3af30d8e177e179c08195d0066de55f03c952a5455735e0",
+    "06-success-valid/status.json": "1e4d5036137950bd7e7d38d2bfbeae5b6e63dda7e5a78efded43312b83d00961",
+    "07-stage-untrusted/staged.json": "a07c4d79a20b29f9ff7ad5afebd8c8de22264293832e4d3c849d0e9cdc844fb8",
+    "08-untrusted-rejected/security-preflight.json": "da64856e12b78baa32652011693e6e6c944b5e4518c249fcda86503a7b7efbca",
+    "08-untrusted-rejected/status.json": "230d52595b8a7aea73d493c72865af7cd25c1e95d2e0699f82bd70cb6b55a953"
+  },
+  "schema": 1,
+  "security_state": {
+    "dis_download_mode": false,
+    "dis_usb_download_mode": false,
+    "enable_security_download": false,
+    "flash_encryption": "disabled",
+    "secure_boot": false
+  },
+  "source_commit": "0f5bd51130c49c33d94a2cb95de93e4107653930"
+}

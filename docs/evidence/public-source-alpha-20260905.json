@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "kind": "public-source-alpha-validation",
+  "date": "2026-09-05",
+  "tested_source_commit": "48c423c60a88a3bc8256aa63a995a53cae5de33e",
+  "tested_export_files": 216,
+  "host": "macOS arm64",
+  "python_version": "Python 3.14.6",
+  "rust_host_toolchain": "1.97.0",
+  "xtensa_toolchain": "esp-1.97.0.0",
+  "checks": {
+    "clean_export_manifest_and_local_references": "passed",
+    "python_tests": 42,
+    "rust_host_tests": 76,
+    "storage_fault_tests": 11,
+    "persistent_state_tests": 13,
+    "rustfmt": "passed",
+    "partition_policy": "passed",
+    "six_security_profiles": "passed",
+    "blocked_final_rom_plan_and_negative_self_tests": "passed",
+    "macos_helper_fixture_suite": "passed"
+  },
+  "target_builds": {
+    "schema": 1,
+    "kind": "public-fixture-target-builds",
+    "results": [
+      {
+        "profile": "s2-development",
+        "command": [
+          "./tools/cargo-esp",
+          "build",
+          "--locked",
+          "--release",
+          "--no-default-features",
+          "--features",
+          "ctaphid-bringup,fido-stack,mcu-esp32s2",
+          "--bin",
+          "rissokey"
+        ],
+        "elf_bytes": 558552,
+        "elf_sha256": "31ff37f1f0644e81deb74c9f361f558bebc89cd151e5911d565aaa11d6bb2821"
+      },
+      {
+        "profile": "s2-protected",
+        "command": [
+          "./tools/cargo-esp",
+          "build",
+          "--locked",
+          "--release",
+          "--no-default-features",
+          "--features",
+          "ctaphid-bringup,fido-stack,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption,signed-ab-update,usb-signed-update",
+          "--bin",
+          "rissokey"
+        ],
+        "elf_bytes": 569500,
+        "elf_sha256": "074c18b4e92769300d1195cdc39078eb12b29b0e78ad84e44052f3fd5000af61"
+      },
+      {
+        "profile": "s3-bringup",
+        "command": [
+          "./tools/cargo-esp",
+          "build",
+          "--locked",
+          "--release",
+          "--no-default-features",
+          "--features",
+          "ctaphid-bringup,fido-stack,mcu-esp32s3",
+          "--bin",
+          "rissokey"
+        ],
+        "elf_bytes": 269960,
+        "elf_sha256": "0de78dbc0014830f2f65d5b8f723db4d386f74b83bc90e6a21986ab4f2d007c4"
+      },
+      {
+        "profile": "s2-attestation-import",
+        "command": [
+          "./tools/cargo-esp",
+          "build",
+          "--locked",
+          "--release",
+          "--no-default-features",
+          "--features",
+          "attestation-import,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption",
+          "--bin",
+          "import-attestation"
+        ],
+        "elf_bytes": 381972,
+        "elf_sha256": "3e0d5beda9c9107045f3fa8f9258ea6779f220b2753ab78e291b36aba400f9ee"
+      }
+    ],
+    "device_accessed": false,
+    "installable_package_created": false,
+    "operational_keys_used": false
+  },
+  "build_scope": "Target builds and helper fixtures ran from the draft export. All 118 compiler/configuration/helper inputs were byte-identical to the clean tested source export. No protected bootloader was rebuilt or installed.",
+  "refactor": {
+    "tools": 12,
+    "shared_helpers": [
+      "git_output",
+      "sha256_file",
+      "is_within",
+      "parse_sdkconfig"
+    ],
+    "extracted_executable_bodies_match_baseline": true,
+    "all_other_tool_functions_and_classes_match_baseline": true,
+    "baseline_commit": "413e70e33ee056e32e306b5b58928e04610d1ae4"
+  },
+  "rustsec": {
+    "cargo_audit": "0.22.2",
+    "database": {
+      "advisory-count": 1239,
+      "last-commit": "5a0ebedfe8bdd2e295b171f4162f8c977bcad9a5",
+      "last-updated": "2026-09-02T11:13:32+02:00"
+    },
+    "vulnerabilities": 0,
+    "unmaintained": [
+      {
+        "package": "atomic-polyfill",
+        "advisory": "RUSTSEC-2023-0089"
+      },
+      {
+        "package": "paste",
+        "advisory": "RUSTSEC-2024-0436"
+      }
+    ]
+  },
+  "licenses": {
+    "resolved_packages": 275,
+    "metadata_declared_license_or_license_file": true,
+    "vendored_license_texts_preserved": true,
+    "tinyrlibc_license_file_noted_in_third_party_notices": true
+  },
+  "prior_public_history": {
+    "commit": "d669ce2c35bd7235841cbb84e705aca242a190a9",
+    "unique_blobs": 384,
+    "content_and_reachable_commit_tag_metadata_policy": "passed",
+    "author_and_committer_metadata_reviewed": true,
+    "private_development_history_excluded": true
+  },
+  "github_ci_run": "not yet run; workflow is part of the candidate",
+  "physical_device_operations": false,
+  "operational_key_access": false,
+  "public_binary_attachments": false,
+  "reproduction": "docs/getting-started.md and .github/workflows/ci.yml"
+}

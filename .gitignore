@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.pyc
+/target/
+/.espup/
+*.elf
+*.bin
+*.uf2
+
+# Local development secrets and generated attestation material.
+/dev-pki/*
+!/dev-pki/README.md
