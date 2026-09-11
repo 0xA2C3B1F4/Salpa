@@ -1,0 +1,1115 @@
+//! Various state of the authenticator.
+//!
+//! Needs cleanup.
+
+pub mod migrate;
+
+use core::num::NonZeroU32;
+use subtle::ConstantTimeEq;
+
+use ctap_types::{
+    ctap2::{
+        config::{DEFAULT_MIN_PIN_LENGTH, MAX_MIN_PIN_LENGTH_RP_IDS, MAX_RP_ID_LENGTH},
+        AttestationFormatsPreference,
+    },
+    // 2022-02-27: 10 credentials
+    sizes::MAX_CREDENTIAL_COUNT_IN_LIST, // U8 currently
+    Error,
+    String,
+};
+use littlefs2_core::{path, Path};
+use trussed_core::{
+    mechanisms::P256,
+    syscall, try_syscall,
+    types::{KeyId, Location, Mechanism, Message, PathBuf},
+    CertificateClient, CryptoClient, FilesystemClient,
+};
+
+use heapless::{
+    binary_heap::{BinaryHeap, Max},
+    Vec,
+};
+
+use crate::{
+    credential::{CredentialIdVersion, FullCredential, KeyEncryptionKey, KeyWrappingKey},
+    ctap2::{self, pin::PinProtocolState},
+    Config, Result,
+};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CachedCredential {
+    pub timestamp: u32,
+    // PathBuf has length 255 + 1, we only need 36 + 1
+    // with `rk/<16B rp_id>/<16B cred_id>` = 4 + 2*32
+    pub path: String<37>,
+}
+
+impl PartialOrd for CachedCredential {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CachedCredential {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.timestamp.cmp(&other.timestamp)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CredentialCacheGeneric<const N: usize>(BinaryHeap<CachedCredential, Max, N>);
+impl<const N: usize> CredentialCacheGeneric<N> {
+    pub fn push(&mut self, item: CachedCredential) {
+        if self.0.len() == self.0.capacity() {
+            self.0.pop();
+        }
+        // self.0.push(item).ok();
+        self.0.push(item).map_err(drop).unwrap();
+    }
+
+    pub fn pop(&mut self) -> Option<CachedCredential> {
+        self.0.pop()
+    }
+
+    pub fn len(&self) -> u32 {
+        self.0.len() as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear()
+    }
+}
+
+pub type CredentialCache = CredentialCacheGeneric<MAX_CREDENTIAL_COUNT_IN_LIST>;
+
+#[derive(Debug)]
+pub struct State {
+    /// Batch device identity (aaguid, certificate, key).
+    pub identity: Identity,
+    pub persistent: PersistentState,
+    pub runtime: RuntimeState,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl State {
+    // pub fn new(trussed: &mut TrussedClient) -> Self {
+    pub fn new() -> Self {
+        // let identity = Identity::get(trussed);
+        let identity = Default::default();
+        let runtime: RuntimeState = Default::default();
+        // let persistent = PersistentState::load_or_reset(trussed);
+        let persistent = Default::default();
+
+        Self {
+            identity,
+            persistent,
+            runtime,
+        }
+    }
+
+    pub fn decrement_retries<T: FilesystemClient>(&mut self, trussed: &mut T) -> Result<()> {
+        self.persistent.decrement_retries(trussed)?;
+        self.runtime.decrement_retries();
+        Ok(())
+    }
+
+    pub fn reset_retries<T: FilesystemClient>(&mut self, trussed: &mut T) -> Result<()> {
+        self.persistent.reset_retries(trussed)?;
+        self.runtime.reset_retries();
+        Ok(())
+    }
+
+    pub fn pin_blocked(&self) -> Result<()> {
+        if self.persistent.pin_blocked() {
+            return Err(Error::PinBlocked);
+        }
+        if self.runtime.pin_blocked() {
+            return Err(Error::PinAuthBlocked);
+        }
+
+        Ok(())
+    }
+}
+
+/// Batch device identity (aaguid, certificate, key).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Identity {
+    // can this be [u8; 16] or need Bytes for serialization?
+    // aaguid: Option<Bytes<consts::U16>>,
+    attestation_key: Option<KeyId>,
+}
+
+pub type Aaguid = [u8; 16];
+pub type Certificate = trussed_core::types::Message;
+
+impl Identity {
+    // Attempt to yank out the aaguid of a certificate.
+    fn yank_aaguid(&mut self, der: &[u8]) -> Option<[u8; 16]> {
+        let aaguid_start_sequence = [
+            // OBJECT IDENTIFIER 1.3.6.1.4.1.45724.1.1.4 (AAGUID)
+            0x06u8, 0x0B, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xE5, 0x1C, 0x01, 0x01, 0x04,
+            // Sequence, 16 bytes
+            0x04, 0x12, 0x04, 0x10,
+        ];
+
+        // Scan for the beginning sequence for AAGUID.
+        let mut cert_reader = der;
+
+        while !cert_reader.is_empty() {
+            if cert_reader.starts_with(&aaguid_start_sequence) {
+                info_now!("found aaguid");
+                break;
+            }
+            cert_reader = &cert_reader[1..];
+        }
+        if cert_reader.is_empty() {
+            return None;
+        }
+
+        cert_reader = &cert_reader[aaguid_start_sequence.len()..];
+
+        let mut aaguid = [0u8; 16];
+        aaguid[..16].clone_from_slice(&cert_reader[..16]);
+        Some(aaguid)
+    }
+
+    /// Lookup batch key and certificate, together with AAUGID.
+    pub fn attestation<T: CryptoClient + CertificateClient>(
+        &mut self,
+        trussed: &mut T,
+    ) -> (Option<(KeyId, Certificate)>, Aaguid) {
+        let key = crate::constants::ATTESTATION_KEY_ID;
+        let attestation_key_exists = syscall!(trussed.exists(Mechanism::P256, key)).exists;
+        if attestation_key_exists {
+            // Will panic if certificate does not exist.
+            let cert =
+                syscall!(trussed.read_certificate(crate::constants::ATTESTATION_CERT_ID)).der;
+
+            let mut aaguid = self.yank_aaguid(cert.as_slice());
+
+            if aaguid.is_none() {
+                // Provide a default
+                aaguid = Some(*b"AAGUID0123456789");
+            }
+
+            (Some((key, cert)), aaguid.unwrap())
+        } else {
+            info_now!("attestation key does not exist");
+            (None, *b"AAGUID0123456789")
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialManagementEnumerateRps {
+    pub remaining: NonZeroU32,
+    pub rp_id_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialManagementEnumerateCredentials {
+    pub remaining: u32,
+    pub prev_filename: PathBuf,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ActiveGetAssertionData {
+    pub last_assertion: core::time::Duration,
+    pub rp_id_hash: [u8; 32],
+    pub client_data_hash: [u8; 32],
+    pub uv_performed: bool,
+    pub up_performed: bool,
+    pub multiple_credentials: bool,
+    pub extensions: Option<ctap_types::ctap2::get_assertion::ExtensionsInput>,
+    pub attestation_formats_preference: Option<AttestationFormatsPreference>,
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeState {
+    pin_protocol: Option<PinProtocolState>,
+    consecutive_pin_mismatches: u8,
+
+    // both of these are a cache for previous Get{Next,}Assertion call
+    cached_credentials: CredentialCache,
+    pub active_get_assertion: Option<ActiveGetAssertionData>,
+    pub cached_rp: Option<CredentialManagementEnumerateRps>,
+    pub cached_rk: Option<CredentialManagementEnumerateCredentials>,
+
+    // largeBlob command
+    pub large_blobs: ctap2::large_blobs::State,
+}
+
+// TODO: Plan towards future extensibility
+//
+// - if we set all fields as optional, and annotate with `skip_serializing if None`,
+// then, missing fields in older fw versions should not cause problems with newer fw
+// versions that potentially add new fields.
+//
+// - empirically, the implementation of Deserialize doesn't seem to mind moving around
+// the order of fields, which is already nice
+//
+// - adding new non-optional fields definitely doesn't parse (but maybe it could?)
+// - same for removing a field
+// Currently, this causes the entire authnr to reset state. Maybe it should even reformat disk
+//
+// - An alternative would be `heapless::Map`, but I'd prefer something more typed.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Default)]
+pub struct PersistentState {
+    #[serde(skip)]
+    // TODO: there has to be a better way than.. this
+    // Pro-tip: it should involve types ^^
+    //
+    // We could alternatively make all methods take a TrussedClient as parameter
+    initialised: bool,
+
+    credential_id_version: Option<CredentialIdVersion>,
+    key_encryption_key: Option<KeyId>,
+    key_wrapping_key: Option<KeyId>,
+    consecutive_pin_mismatches: u8,
+    #[serde(with = "serde_bytes")]
+    pin_hash: Option<[u8; 16]>,
+    /// Code-point length of the PIN whose hash sits in `pin_hash`
+    /// (CTAP 2.1 §6.5.5.5 / §6.11.4 step 2.5 — "PINCodePointLength").
+    /// Captured at setPIN/changePIN time; `0` when no PIN is set or when
+    /// the field was added in a migration (treated as "unknown", forcing
+    /// a PIN change on the next `setMinPINLength` with a non-zero floor).
+    #[serde(default)]
+    pin_code_point_length: u8,
+    /// Global signature counter.
+    timestamp: u32,
+
+    /// Configured minimum PIN length (CTAP 2.1 `setMinPINLength`, §6.11.4
+    /// subcmd 0x03). `0` means "no override; use the spec default of 4".
+    #[serde(default)]
+    min_pin_length: u8,
+
+    /// RP IDs that should automatically receive the `minPinLength` extension
+    /// output without explicit request (CTAP 2.1 `setMinPINLength`).
+    #[serde(default)]
+    min_pin_length_rp_ids: Vec<String<MAX_RP_ID_LENGTH>, MAX_MIN_PIN_LENGTH_RP_IDS>,
+
+    /// `forcePINChange` (CTAP 2.1 §6.4 0x0C). When `true`, the authenticator
+    /// rejects every operation that requires `clientPin` until the platform
+    /// successfully calls `clientPin.changePIN`.
+    #[serde(default)]
+    force_pin_change: bool,
+
+    /// `alwaysUv` (CTAP 2.1 §6.11.3). When `true`, every MakeCredential and
+    /// GetAssertion must carry a valid `pinUvAuthParam`; ops without UV are
+    /// rejected with `PinRequired`.
+    #[serde(default)]
+    always_uv: bool,
+}
+
+impl PersistentState {
+    const RESET_RETRIES: u8 = 8;
+    const FILENAME: &'static Path = path!("persistent-state.cbor");
+    pub const INITIALIZATION_MARKER_FILENAME: &'static Path = path!("persistent-state.init");
+    pub const INITIALIZATION_MARKER: &'static [u8] = b"rissokey-persistent-state-init-v1\n";
+
+    /// The default value for the state if it is initialized for the first time or reset.
+    fn reset_value(config: &Config) -> Self {
+        Self {
+            initialised: false,
+            key_encryption_key: None,
+            key_wrapping_key: None,
+            credential_id_version: config.credential_id_version,
+            consecutive_pin_mismatches: 0,
+            pin_hash: None,
+            pin_code_point_length: 0,
+            // Setting the signature counter to zero indicates that it is not supported or that a
+            // counter error occured, so we have to initialize it with a non-zero value.
+            timestamp: 1,
+            min_pin_length: 0,
+            min_pin_length_rp_ids: Vec::new(),
+            force_pin_change: false,
+            always_uv: false,
+        }
+    }
+
+    fn entry_exists<T: FilesystemClient>(trussed: &mut T, path: &'static Path) -> Result<bool> {
+        let metadata =
+            try_syscall!(trussed.entry_metadata(Location::Internal, PathBuf::from(path)))
+                .map_err(|_| Error::Other)?
+                .metadata;
+        Ok(metadata.is_some())
+    }
+
+    fn load<T: FilesystemClient>(trussed: &mut T) -> Result<Option<Self>> {
+        if !Self::entry_exists(trussed, Self::FILENAME)? {
+            return Ok(None);
+        }
+
+        let data =
+            try_syscall!(trussed.read_file(Location::Internal, PathBuf::from(Self::FILENAME)))
+                .map_err(|_| Error::Other)?
+                .data;
+
+        let state: Self = cbor_smol::cbor_deserialize(&data).map_err(|_err| {
+            info!("err deser'ing: {_err:?}",);
+            Error::Other
+        })?;
+
+        debug!("Loaded persistent state");
+
+        Ok(Some(state))
+    }
+
+    fn verify_initialization_marker<T: FilesystemClient>(trussed: &mut T) -> Result<()> {
+        let marker = try_syscall!(trussed.read_file(
+            Location::Internal,
+            PathBuf::from(Self::INITIALIZATION_MARKER_FILENAME),
+        ))
+        .map_err(|_| Error::Other)?
+        .data;
+        if marker.as_slice() != Self::INITIALIZATION_MARKER {
+            return Err(Error::Other);
+        }
+        Ok(())
+    }
+
+    fn remove_initialization_marker<T: FilesystemClient>(trussed: &mut T) -> Result<()> {
+        try_syscall!(trussed.remove_file(
+            Location::Internal,
+            PathBuf::from(Self::INITIALIZATION_MARKER_FILENAME),
+        ))
+        .map_err(|_| Error::Other)?;
+        Ok(())
+    }
+
+    pub fn save<T: FilesystemClient>(&self, trussed: &mut T) -> Result<()> {
+        let mut data = Message::new();
+        cbor_smol::cbor_serialize_to(self, &mut data).unwrap();
+
+        syscall!(trussed.write_file(
+            Location::Internal,
+            PathBuf::from(Self::FILENAME),
+            data,
+            None,
+        ));
+        Ok(())
+    }
+
+    pub fn reset<T: CryptoClient + FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+        config: &Config,
+    ) -> Result<()> {
+        if let Some(key) = self.key_encryption_key {
+            syscall!(trussed.delete(key));
+        }
+        if let Some(key) = self.key_wrapping_key {
+            syscall!(trussed.delete(key));
+        }
+        *self = Self::reset_value(config);
+        self.initialised = true;
+        self.save(trussed)
+    }
+
+    pub fn load_if_not_initialised<T: FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+        config: &Config,
+    ) -> Result<()> {
+        if self.initialised {
+            return Ok(());
+        }
+
+        let mut state = match Self::load(trussed)? {
+            Some(previous_state) => {
+                if Self::entry_exists(trussed, Self::INITIALIZATION_MARKER_FILENAME)? {
+                    Self::verify_initialization_marker(trussed)?;
+                    Self::remove_initialization_marker(trussed)?;
+                }
+                previous_state
+            }
+            None => {
+                Self::verify_initialization_marker(trussed)?;
+                let mut initial_state = Self::reset_value(config);
+                initial_state.initialised = true;
+                initial_state.save(trussed)?;
+                Self::remove_initialization_marker(trussed)?;
+                initial_state
+            }
+        };
+        state.initialised = true;
+        *self = state;
+        Ok(())
+    }
+
+    pub fn signature_counter<T: CryptoClient + FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+    ) -> Result<u32> {
+        let now = self.timestamp;
+        // 0 indicates a counter overflow. If this is the case, we can no longer increment the
+        // counter and have to always return 0, see Requirement 2.3.2 in the Security Requirements
+        // v1.5.
+        if now > 0 {
+            // As we use a global signature counter, we have to increment it by a random (positive)
+            // number to ensure that it cannot be used to correlate authenticators.
+            // The signature counter is a u32, so incrementing it by at most 256 still gives us plenty
+            // of time until the counter overflows.
+            let increment = syscall!(trussed.random_bytes(1)).bytes[0];
+            if let Some(timestamp) = self.timestamp.checked_add(u32::from(increment) + 1) {
+                self.timestamp = timestamp;
+            } else {
+                // Indicate an overflow by setting the counter to 0.
+                self.timestamp = 0;
+            }
+            self.save(trussed)?;
+        }
+        Ok(now)
+    }
+
+    pub fn credential_id_version(&self) -> CredentialIdVersion {
+        self.credential_id_version
+            .unwrap_or(CredentialIdVersion::V1)
+    }
+
+    pub fn key_encryption_key<T: CryptoClient + FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+    ) -> Result<KeyEncryptionKey> {
+        match self.key_encryption_key {
+            Some(key) => Ok(KeyEncryptionKey(key)),
+            None => self.rotate_key_encryption_key(trussed),
+        }
+    }
+
+    pub fn rotate_key_encryption_key<T: CryptoClient + FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+    ) -> Result<KeyEncryptionKey> {
+        if let Some(key) = self.key_encryption_key {
+            syscall!(trussed.delete(key));
+        }
+        let key = self
+            .credential_id_version()
+            .generate_key_encryption_key(trussed);
+        self.key_encryption_key = Some(key.0);
+        self.save(trussed)?;
+        Ok(key)
+    }
+
+    pub fn key_wrapping_key<T: CryptoClient + FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+    ) -> Result<KeyWrappingKey> {
+        match self.key_wrapping_key {
+            Some(key) => Ok(KeyWrappingKey(key)),
+            None => self.rotate_key_wrapping_key(trussed),
+        }
+    }
+
+    pub fn rotate_key_wrapping_key<T: CryptoClient + FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+    ) -> Result<KeyWrappingKey> {
+        if let Some(key) = self.key_wrapping_key {
+            syscall!(trussed.delete(key));
+        }
+        let key = self
+            .credential_id_version()
+            .generate_key_wrapping_key(trussed);
+        self.key_wrapping_key = Some(key.0);
+        self.save(trussed)?;
+        Ok(key)
+    }
+
+    pub fn pin_is_set(&self) -> bool {
+        self.pin_hash.is_some()
+    }
+
+    pub fn retries(&self) -> u8 {
+        Self::RESET_RETRIES.saturating_sub(self.consecutive_pin_mismatches)
+    }
+
+    pub fn pin_blocked(&self) -> bool {
+        self.consecutive_pin_mismatches >= Self::RESET_RETRIES
+    }
+
+    fn reset_retries<T: FilesystemClient>(&mut self, trussed: &mut T) -> Result<()> {
+        if self.consecutive_pin_mismatches > 0 {
+            self.consecutive_pin_mismatches = 0;
+            self.save(trussed)?;
+        }
+        Ok(())
+    }
+
+    fn decrement_retries<T: FilesystemClient>(&mut self, trussed: &mut T) -> Result<()> {
+        // error to call before initialization
+        if self.consecutive_pin_mismatches < Self::RESET_RETRIES {
+            self.consecutive_pin_mismatches += 1;
+            self.save(trussed)?;
+            if self.consecutive_pin_mismatches == 0 {
+                return Err(Error::PinBlocked);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn pin_hash(&self) -> Option<[u8; 16]> {
+        self.pin_hash
+    }
+
+    /// PINCodePointLength of the currently-stored PIN (CTAP 2.1 §6.5.5.5),
+    /// captured at setPIN/changePIN time. Returns `0` when no PIN is set
+    /// — step 2.5 of §6.11.4 still consults it, and `0 < any non-zero
+    /// newMinPINLength` correctly forces a change.
+    pub fn pin_code_point_length(&self) -> u8 {
+        self.pin_code_point_length
+    }
+
+    pub fn set_pin_hash<T: FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+        pin_hash: [u8; 16],
+        pin_code_point_length: u8,
+    ) -> Result<()> {
+        // Idempotent: if the same hash is being written and forcePINChange is
+        // already clear, skip the flash write. Also — and more importantly —
+        // if the platform "changes" the PIN to the same value, we must not
+        // clear `force_pin_change` (the user hasn't actually complied with
+        // the change request). The spec-mandated reject for "forcePINChange
+        // + new==old" lives in the changePIN handler; this check is a belt-
+        // and-braces against any other caller path.
+        if self
+            .pin_hash
+            .is_some_and(|stored| bool::from(stored.ct_eq(&pin_hash)))
+        {
+            return Ok(());
+        }
+        self.pin_hash = Some(pin_hash);
+        self.pin_code_point_length = pin_code_point_length;
+        // Successfully (re)setting the PIN clears any pending forcePINChange
+        // request — the platform has just complied (CTAP 2.1 §6.5.5.6 /
+        // §6.5.5.7).
+        self.force_pin_change = false;
+        self.save(trussed)?;
+        Ok(())
+    }
+
+    /// Configured minimum PIN length, never less than the CTAP 2.1 floor.
+    pub fn min_pin_length(&self) -> u8 {
+        core::cmp::max(self.min_pin_length, DEFAULT_MIN_PIN_LENGTH)
+    }
+
+    pub fn set_min_pin_length<T: FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+        new_value: u8,
+    ) -> Result<()> {
+        // Spec: setMinPINLength may only raise the value, never lower it.
+        let cur = self.min_pin_length();
+        if new_value < cur {
+            return Err(Error::PinPolicyViolation);
+        }
+
+        if new_value == cur {
+            return Ok(());
+        }
+
+        self.min_pin_length = new_value;
+        self.save(trussed)?;
+        Ok(())
+    }
+
+    pub fn min_pin_length_rp_ids(&self) -> &[heapless::String<MAX_RP_ID_LENGTH>] {
+        &self.min_pin_length_rp_ids
+    }
+
+    pub fn set_min_pin_length_rp_ids<T: FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+        rp_ids: heapless::Vec<heapless::String<MAX_RP_ID_LENGTH>, MAX_MIN_PIN_LENGTH_RP_IDS>,
+    ) -> Result<()> {
+        self.min_pin_length_rp_ids = rp_ids;
+        self.save(trussed)?;
+        Ok(())
+    }
+
+    pub fn force_pin_change(&self) -> bool {
+        self.force_pin_change
+    }
+
+    /// Set the persistent `forcePINChange` flag. Idempotent — no save if the
+    /// flag is already at the requested value.
+    pub fn set_force_pin_change<T: FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+        value: bool,
+    ) -> Result<()> {
+        if self.force_pin_change == value {
+            return Ok(());
+        }
+        self.force_pin_change = value;
+        self.save(trussed)?;
+        Ok(())
+    }
+
+    pub fn always_uv(&self) -> bool {
+        self.always_uv
+    }
+
+    pub fn toggle_always_uv<T: FilesystemClient>(&mut self, trussed: &mut T) -> Result<()> {
+        self.always_uv = !self.always_uv;
+        self.save(trussed)
+    }
+}
+
+impl RuntimeState {
+    const POWERCYCLE_RETRIES: u8 = 3;
+
+    fn decrement_retries(&mut self) {
+        if self.consecutive_pin_mismatches < Self::POWERCYCLE_RETRIES {
+            self.consecutive_pin_mismatches += 1;
+        }
+    }
+
+    fn reset_retries(&mut self) {
+        self.consecutive_pin_mismatches = 0;
+    }
+
+    pub fn pin_blocked(&self) -> bool {
+        self.consecutive_pin_mismatches >= Self::POWERCYCLE_RETRIES
+    }
+
+    // pub fn cached_credentials(&mut self) -> &mut CredentialCache {
+    //     &mut self.cached_credentials
+    //     // if let Some(cache) = self.cached_credentials.as_mut() {
+    //     //     return cache
+    //     // }
+    //     // self.cached_credentials.insert(CredentialCache::new())
+    // }
+
+    pub fn clear_credential_cache(&mut self) {
+        self.cached_credentials.clear()
+    }
+
+    pub fn push_credential(&mut self, credential: CachedCredential) {
+        self.cached_credentials.push(credential);
+    }
+
+    pub fn pop_credential<T: FilesystemClient>(
+        &mut self,
+        trussed: &mut T,
+    ) -> Option<FullCredential> {
+        let cached_credential = self.cached_credentials.pop()?;
+
+        let credential_data = syscall!(trussed.read_file(
+            Location::Internal,
+            PathBuf::try_from(cached_credential.path.as_str()).unwrap(),
+        ))
+        .data;
+
+        FullCredential::deserialize(&credential_data).ok()
+    }
+
+    pub fn remaining_credentials(&self) -> u32 {
+        self.cached_credentials.len() as _
+    }
+
+    pub fn pin_protocol<T: P256>(&mut self, trussed: &mut T) -> &mut PinProtocolState {
+        self.pin_protocol
+            .get_or_insert_with(|| PinProtocolState::new(trussed))
+    }
+
+    /// Observe before every dispatched command, including unauthenticated
+    /// continuation commands, so expired grants cannot retain enumeration state.
+    pub fn observe_pin_tokens<T: CryptoClient + trussed_core::ManagementClient>(
+        &mut self,
+        trussed: &mut T,
+    ) {
+        let Some(protocol) = self.pin_protocol.as_mut() else {
+            return;
+        };
+        match try_syscall!(trussed.uptime()) {
+            Ok(reply) if !protocol.observe_usage_timer(trussed, reply.uptime) => {}
+            _ => self.invalidate_pin_tokens(trussed),
+        }
+    }
+
+    pub fn invalidate_pin_tokens<T: CryptoClient>(&mut self, trussed: &mut T) {
+        if let Some(protocol) = self.pin_protocol.as_mut() {
+            protocol.reset_pin_tokens(trussed);
+        }
+        self.cached_rp = None;
+        self.cached_rk = None;
+        self.active_get_assertion = None;
+        self.clear_credential_cache();
+    }
+
+    pub fn consume_token_user_presence(&mut self) {
+        if let Some(protocol) = self.pin_protocol.as_mut() {
+            protocol.consume_user_presence();
+        }
+    }
+
+    pub fn reset<T: CryptoClient + P256>(&mut self, trussed: &mut T) {
+        // Could use `free_credential_heap`, but since we're deleting everything here, this is quicker.
+        syscall!(trussed.delete_all(Location::Volatile));
+        self.clear_credential_cache();
+        self.active_get_assertion = None;
+
+        // Clear any in-flight credMgmt enumeration cursors. Otherwise a
+        // `next_relying_party`/`next_credential` call straight after
+        // `authenticatorReset` succeeds with stale data instead of
+        // returning `NotAllowed` (caught by fido2-tests
+        // test_rpnext_without_rpbegin).
+        self.cached_rp = None;
+        self.cached_rk = None;
+
+        // The per-power-cycle pinAuthFailedAttempts counter is runtime
+        // state and lives here. `authenticatorReset` removes the PIN
+        // entirely (caller resets the persistent retries counter via
+        // `PersistentState::reset`), so the per-power-cycle counter
+        // should drop with it.
+        self.consecutive_pin_mismatches = 0;
+
+        if let Some(pin_protocol) = self.pin_protocol.take() {
+            pin_protocol.reset(trussed);
+        }
+        // to speed up future operations, we already generate the key agreement key
+        self.pin_protocol = Some(PinProtocolState::new(trussed));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+    use core::task::Poll;
+    use hex_literal::hex;
+    use trussed::{
+        backend::BackendId,
+        virt::{self, StoreConfig},
+    };
+    use trussed_core::{
+        api::{Reply, RequestVariant},
+        ClientResult, Error as TrussedError, FilesystemClient, FutureResult, PollClient,
+    };
+    use trussed_staging::virt::{BackendIds, Dispatcher};
+
+    fn message(data: &[u8]) -> Message {
+        Message::try_from(data).unwrap()
+    }
+
+    fn write_initialization_marker<T: FilesystemClient>(client: &mut T) {
+        trussed_core::syscall!(client.write_file(
+            Location::Internal,
+            PathBuf::from(PersistentState::INITIALIZATION_MARKER_FILENAME),
+            message(PersistentState::INITIALIZATION_MARKER),
+            None,
+        ));
+    }
+
+    struct ReadErrorClient;
+
+    impl PollClient for ReadErrorClient {
+        fn request<Rq: RequestVariant>(
+            &mut self,
+            _request: Rq,
+        ) -> ClientResult<'_, Rq::Reply, Self> {
+            Ok(FutureResult::new(self))
+        }
+
+        fn poll(&mut self) -> Poll<core::result::Result<Reply, TrussedError>> {
+            Poll::Ready(Err(TrussedError::FilesystemReadFailure))
+        }
+    }
+
+    impl FilesystemClient for ReadErrorClient {}
+
+    #[test]
+    fn deser() {
+        let _state: PersistentState = cbor_smol::cbor_deserialize(&hex!(
+            "
+            a5726b65795f656e6372797074696f6e5f6b657950b19a5a2845e5ec71e3
+            2a1b890892376c706b65795f7772617070696e675f6b6579f6781a636f6e
+            73656375746976655f70696e5f6d69736d617463686573006870696e5f68
+            6173689018ef1879187c1881181818f0182d18fb186418960718dd185d18
+            3f188c18766974696d657374616d7009
+        "
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn test_signature_counter() {
+        let config = Config::new(0);
+        virt::with_platform(StoreConfig::ram(), |platform| {
+            platform.run_client_with_backends(
+                "fido",
+                Dispatcher::default(),
+                &[
+                    BackendId::Custom(BackendIds::StagingBackend),
+                    BackendId::Core,
+                ],
+                |mut client| {
+                    write_initialization_marker(&mut client);
+                    let mut state = PersistentState::default();
+                    state.load_if_not_initialised(&mut client, &config).unwrap();
+
+                    let counter1 = state.signature_counter(&mut client).unwrap();
+                    let counter2 = state.signature_counter(&mut client).unwrap();
+                    let counter3 = state.signature_counter(&mut client).unwrap();
+                    let counter4 = state.signature_counter(&mut client).unwrap();
+                    let counter5 = state.signature_counter(&mut client).unwrap();
+
+                    assert_eq!(counter1, 1);
+                    assert!(counter2 > counter1);
+                    assert!(counter3 > counter2);
+                    assert!(counter4 > counter3);
+                    assert!(counter5 > counter4);
+                    // The random value should not be zero four times ...
+                    assert!(counter5 > counter1 + 4);
+                    assert!(counter5 < counter1 + 4 * 256);
+
+                    // counter goes into error state after overflow
+                    state.timestamp = u32::MAX;
+                    let counter6 = state.signature_counter(&mut client).unwrap();
+                    let counter7 = state.signature_counter(&mut client).unwrap();
+                    let counter8 = state.signature_counter(&mut client).unwrap();
+                    let counter9 = state.signature_counter(&mut client).unwrap();
+
+                    assert_eq!(counter6, u32::MAX);
+                    assert_eq!(counter7, 0);
+                    assert_eq!(counter8, 0);
+                    assert_eq!(counter9, 0);
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn missing_state_without_marker_is_rejected_without_writes() {
+        let config = Config::new(0);
+        virt::with_platform(StoreConfig::ram(), |platform| {
+            platform.run_client_with_backends(
+                "fido",
+                Dispatcher::default(),
+                &[
+                    BackendId::Custom(BackendIds::StagingBackend),
+                    BackendId::Core,
+                ],
+                |mut client| {
+                    let mut state = PersistentState::default();
+                    assert_eq!(
+                        state.load_if_not_initialised(&mut client, &config),
+                        Err(Error::Other)
+                    );
+                    assert!(!state.initialised);
+                    assert!(trussed_core::try_syscall!(client.entry_metadata(
+                        Location::Internal,
+                        PathBuf::from(PersistentState::FILENAME),
+                    ))
+                    .unwrap()
+                    .metadata
+                    .is_none());
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn valid_marker_allows_one_initialization_and_is_consumed() {
+        let config = Config::new(0);
+        virt::with_platform(StoreConfig::ram(), |platform| {
+            platform.run_client_with_backends(
+                "fido",
+                Dispatcher::default(),
+                &[
+                    BackendId::Custom(BackendIds::StagingBackend),
+                    BackendId::Core,
+                ],
+                |mut client| {
+                    write_initialization_marker(&mut client);
+                    let mut state = PersistentState::default();
+                    state.load_if_not_initialised(&mut client, &config).unwrap();
+                    assert!(state.initialised);
+                    assert!(trussed_core::try_syscall!(client.entry_metadata(
+                        Location::Internal,
+                        PathBuf::from(PersistentState::FILENAME),
+                    ))
+                    .unwrap()
+                    .metadata
+                    .is_some());
+                    assert!(trussed_core::try_syscall!(client.entry_metadata(
+                        Location::Internal,
+                        PathBuf::from(PersistentState::INITIALIZATION_MARKER_FILENAME),
+                    ))
+                    .unwrap()
+                    .metadata
+                    .is_none());
+
+                    let mut reloaded = PersistentState::default();
+                    reloaded
+                        .load_if_not_initialised(&mut client, &config)
+                        .unwrap();
+                    assert_eq!(state, reloaded);
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn malformed_marker_is_rejected_without_creating_state() {
+        let config = Config::new(0);
+        virt::with_platform(StoreConfig::ram(), |platform| {
+            platform.run_client_with_backends(
+                "fido",
+                Dispatcher::default(),
+                &[
+                    BackendId::Custom(BackendIds::StagingBackend),
+                    BackendId::Core,
+                ],
+                |mut client| {
+                    let malformed = message(b"not-an-initialization-marker\n");
+                    trussed_core::syscall!(client.write_file(
+                        Location::Internal,
+                        PathBuf::from(PersistentState::INITIALIZATION_MARKER_FILENAME),
+                        malformed.clone(),
+                        None,
+                    ));
+                    let mut state = PersistentState::default();
+                    assert_eq!(
+                        state.load_if_not_initialised(&mut client, &config),
+                        Err(Error::Other)
+                    );
+                    let stored = trussed_core::syscall!(client.read_file(
+                        Location::Internal,
+                        PathBuf::from(PersistentState::INITIALIZATION_MARKER_FILENAME),
+                    ))
+                    .data;
+                    assert_eq!(stored, malformed);
+                    assert!(trussed_core::try_syscall!(client.entry_metadata(
+                        Location::Internal,
+                        PathBuf::from(PersistentState::FILENAME),
+                    ))
+                    .unwrap()
+                    .metadata
+                    .is_none());
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn truncated_state_is_rejected_without_mutating_state_or_marker() {
+        let config = Config::new(0);
+        virt::with_platform(StoreConfig::ram(), |platform| {
+            platform.run_client_with_backends(
+                "fido",
+                Dispatcher::default(),
+                &[
+                    BackendId::Custom(BackendIds::StagingBackend),
+                    BackendId::Core,
+                ],
+                |mut client| {
+                    write_initialization_marker(&mut client);
+                    let truncated = message(&[0xa1]);
+                    trussed_core::syscall!(client.write_file(
+                        Location::Internal,
+                        PathBuf::from(PersistentState::FILENAME),
+                        truncated.clone(),
+                        None,
+                    ));
+                    let mut state = PersistentState::default();
+                    assert_eq!(
+                        state.load_if_not_initialised(&mut client, &config),
+                        Err(Error::Other)
+                    );
+                    assert!(!state.initialised);
+                    assert_eq!(
+                        trussed_core::syscall!(client.read_file(
+                            Location::Internal,
+                            PathBuf::from(PersistentState::FILENAME),
+                        ))
+                        .data,
+                        truncated
+                    );
+                    assert_eq!(
+                        trussed_core::syscall!(client.read_file(
+                            Location::Internal,
+                            PathBuf::from(PersistentState::INITIALIZATION_MARKER_FILENAME),
+                        ))
+                        .data
+                        .as_slice(),
+                        PersistentState::INITIALIZATION_MARKER
+                    );
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn bit_flipped_state_is_rejected_without_mutation() {
+        let config = Config::new(0);
+        virt::with_platform(StoreConfig::ram(), |platform| {
+            platform.run_client_with_backends(
+                "fido",
+                Dispatcher::default(),
+                &[
+                    BackendId::Custom(BackendIds::StagingBackend),
+                    BackendId::Core,
+                ],
+                |mut client| {
+                    write_initialization_marker(&mut client);
+                    let mut initialized = PersistentState::default();
+                    initialized
+                        .load_if_not_initialised(&mut client, &config)
+                        .unwrap();
+
+                    let mut corrupted = trussed_core::syscall!(client
+                        .read_file(Location::Internal, PathBuf::from(PersistentState::FILENAME),))
+                    .data;
+                    corrupted[0] ^= 0xff;
+                    trussed_core::syscall!(client.write_file(
+                        Location::Internal,
+                        PathBuf::from(PersistentState::FILENAME),
+                        corrupted.clone(),
+                        None,
+                    ));
+
+                    let mut reloaded = PersistentState::default();
+                    assert_eq!(
+                        reloaded.load_if_not_initialised(&mut client, &config),
+                        Err(Error::Other)
+                    );
+                    assert!(!reloaded.initialised);
+                    assert_eq!(
+                        trussed_core::syscall!(client.read_file(
+                            Location::Internal,
+                            PathBuf::from(PersistentState::FILENAME),
+                        ))
+                        .data,
+                        corrupted
+                    );
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn metadata_read_error_is_rejected_without_initializing_memory_state() {
+        let config = Config::new(0);
+        let mut client = ReadErrorClient;
+        let mut state = PersistentState::default();
+        assert_eq!(
+            state.load_if_not_initialised(&mut client, &config),
+            Err(Error::Other)
+        );
+        assert!(!state.initialised);
+        assert_eq!(state, PersistentState::default());
+    }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "interchange"
+version = "0.3.2"
+authors = ["The Trussed developers", "Nicolas Stalder <n@stalder.io>"]
+edition = "2018"
+description = "Request/response mechanism for embedded development, using atomics"
+repository = "https://github.com/trussed-dev/interchange"
+readme = "README.md"
+license = "Apache-2.0 OR MIT"
+documentation = "https://docs.rs/interchange"
+keywords = ["cortex-m", "nxp", "lpc"]
+categories = ["development-tools", "embedded"]
+rust-version = "1.79"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.5"
+
+[dependencies]
+portable-atomic = { version = "1", default-features = false, features = ["require-cas"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

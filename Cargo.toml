@@ -1,0 +1,160 @@
+[package]
+description = "USB FIDO2 security-key firmware for ESP32-S2 and ESP32-S3"
+edition = "2024"
+license = "MIT"
+name = "salpa"
+rust-version = "1.88"
+version = "0.1.0"
+
+[features]
+default = ["mcu-esp32s3", "fido-stack"]
+ctaphid-bringup = [
+    "usb-bringup",
+    "dep:ctap-types",
+    "dep:delog",
+    "delog/portable-atomic",
+]
+fido-stack = [
+    "dep:ctaphid-dispatch",
+    "dep:delog",
+    "dep:embedded-storage",
+    "dep:esp-storage",
+    "dep:fido-authenticator",
+    "dep:heapless-bytes",
+    "dep:littlefs2",
+    "dep:littlefs2-sys",
+    "dep:rand_core",
+    "dep:trussed",
+    "dep:trussed-core",
+    "dep:trussed-fs-info",
+    "dep:trussed-hkdf",
+    "dep:trussed-staging",
+    "delog/portable-atomic",
+    "esp-hal/unstable",
+]
+firmware-diagnostics = [
+    "dep:esp-backtrace",
+    "dep:esp-println",
+    "esp-println/auto",
+    "esp-println/critical-section",
+]
+physical-storage-fault-test = ["fido-stack", "firmware-diagnostics"]
+non-strapping-user-presence = []
+security-epoch-preview = ["release-flash-encryption", "usb-signed-update"]
+security-epoch-maintenance = ["release-flash-encryption", "usb-signed-update"]
+release-flash-encryption = ["signed-ab-update", "non-strapping-user-presence"]
+signed-ab-update = ["fido-stack"]
+usb-signed-update = ["signed-ab-update"]
+signed-ab-failure-test = ["signed-ab-update"]
+signed-ab-success-test = ["signed-ab-update"]
+mcu-esp32s2 = [
+    "dep:critical-section",
+    "dep:esp-bootloader-esp-idf",
+    "dep:esp-hal",
+    "esp-backtrace?/esp32s2",
+    "esp-bootloader-esp-idf/esp32s2",
+    "esp-hal/esp32s2",
+    "esp-println?/esp32s2",
+    "esp-storage?/esp32s2",
+]
+mcu-esp32s3 = [
+    "dep:critical-section",
+    "dep:esp-bootloader-esp-idf",
+    "dep:esp-hal",
+    "esp-backtrace?/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+    "esp-hal/esp32s3",
+    "esp-println?/esp32s3",
+    "esp-storage?/esp32s3",
+]
+development-provisioning = ["storage-provisioning"]
+attestation-import = ["fido-stack", "release-flash-encryption", "firmware-diagnostics"]
+storage-provisioning = ["fido-stack", "firmware-diagnostics"]
+usb-bringup = ["dep:usb-device", "dep:usbd-hid", "esp-hal/unstable"]
+
+[[bin]]
+name = "salpa"
+path = "src/bin/main.rs"
+
+[[bin]]
+name = "provision-storage"
+path = "src/bin/provision-storage.rs"
+required-features = ["mcu-esp32s2", "storage-provisioning"]
+
+[[bin]]
+name = "provision-development"
+path = "src/bin/provision-development.rs"
+required-features = ["mcu-esp32s2", "development-provisioning"]
+
+[[bin]]
+name = "import-attestation"
+path = "src/bin/import-attestation.rs"
+required-features = ["mcu-esp32s2", "attestation-import"]
+
+[[bin]]
+name = "storage-powercut-test"
+path = "src/bin/storage-powercut-test.rs"
+required-features = ["mcu-esp32s2", "physical-storage-fault-test"]
+
+[dependencies]
+critical-section = { version = "1.2.0", optional = true }
+ctap-types = { git = "https://github.com/solokeys/ctap-types", rev = "3a5bcecb5286630f38dcc3c65a8f500f7abf2d42", optional = true }
+ctaphid-dispatch = { version = "0.4.0", optional = true }
+delog = { version = "0.1.8", optional = true }
+embedded-storage = { version = "0.3.1", optional = true }
+esp-backtrace = { version = "0.19.0", default-features = false, features = ["panic-handler", "println"], optional = true }
+esp-bootloader-esp-idf = { version = "0.5.0", optional = true }
+esp-hal = { version = "=1.1.2", optional = true }
+esp-println = { version = "0.17.0", default-features = false, optional = true }
+esp-storage = { version = "=0.9.0", default-features = false, features = ["critical-section"], optional = true }
+fido-authenticator = { path = "third_party/fido-authenticator", features = [
+    "credential-id-format-v2",
+    "dispatch",
+], optional = true }
+heapless-bytes = { version = "0.5.0", optional = true }
+littlefs2 = { version = "0.8.1", features = ["c-stubs"], optional = true }
+littlefs2-sys = { version = "0.4.0", features = ["tinyrlibc"], optional = true }
+rand_core = { version = "0.6.4", optional = true }
+sha2 = { version = "0.10.9", default-features = false }
+trussed = { git = "https://github.com/solokeys/trussed", rev = "2ea719b28245f0e68960e99aab16131f7f14d8ff", default-features = false, features = [
+    "aes256-cbc",
+    "aes256-gcm",
+    "certificate-client",
+    "chacha8-poly1305",
+    "crypto-client",
+    "ed255",
+    "filesystem-client",
+    "hmac-sha256",
+    "management-client",
+    "p256",
+    "sha256",
+    "ui-client",
+], optional = true }
+trussed-core = { path = "third_party/trussed-core", features = ["aes256-gcm"], optional = true }
+trussed-fs-info = { version = "0.3.0", optional = true }
+trussed-hkdf = { version = "0.4.0", optional = true }
+trussed-staging = { version = "0.5.0", default-features = false, features = [
+    "fs-info",
+    "hkdf",
+], optional = true }
+usb-device = { version = "=0.3.2", optional = true }
+usbd-hid = { version = "=0.10.1", optional = true }
+zeroize = { version = "1.9.0", default-features = false }
+
+[patch.crates-io]
+ctap-types = { git = "https://github.com/solokeys/ctap-types", rev = "3a5bcecb5286630f38dcc3c65a8f500f7abf2d42" }
+interchange = { path = "third_party/interchange" }
+ref-swap = { path = "third_party/ref-swap" }
+trussed = { git = "https://github.com/solokeys/trussed", rev = "2ea719b28245f0e68960e99aab16131f7f14d8ff" }
+trussed-core = { path = "third_party/trussed-core" }
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 0
+lto = "fat"
+opt-level = "s"
+overflow-checks = true
+strip = "debuginfo"

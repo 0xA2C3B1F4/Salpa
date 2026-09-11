@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "kind": "salpa-device-acceptance-receipt",
+  "evidence_type": "sanitized summary of retained private test records and manual browser result",
+  "date": "2026-09-10",
+  "source_commit": "33d18d963d68ce9754b85a8b2c0ca74d44715f8e",
+  "board": "WEMOS S2 Mini, ESP32-S2, 4 MiB flash",
+  "profile": "normal protected S2 runtime with encrypted credential storage and signed A/B updates",
+  "image": {
+    "sha256": "ea6ef85f75fd39c99feae8e24cdf4c211ec52e3ef0f024fb59a725ee3fc8f5ff",
+    "size_bytes": 425984,
+    "version": "0.1.0",
+    "security_version": 5,
+    "signature_verified": true,
+    "signature_verifier": {
+      "name": "espsecure",
+      "package": "esptool",
+      "version": "5.4.0"
+    }
+  },
+  "result": "passed for the recorded startup and normal-runtime checks",
+  "installation": {
+    "inactive_slot_checked_before_erase": 1,
+    "installed_slot": 1,
+    "activation_completed": true
+  },
+  "boot_binding": {
+    "method": "After cold boot, a fresh GPIO16-approved Begin returned inactive slot 0; Abort ended the session before erase or write. Together with installation into slot 1, this confirms the candidate slot was running. Both images report version 0.1.0.",
+    "running_slot": 1,
+    "returned_inactive_slot": 0,
+    "session_aborted_before_erase": true,
+    "advance_operations": 0,
+    "write_operations": 0
+  },
+  "checks": {
+    "usb_power_cycle": "passed; USB removed for about five seconds and reconnected",
+    "ctaphid_init_fragmented_ping_get_info": "passed",
+    "security_policy_readback": "passed",
+    "pms_permissions_and_locks_readback": "passed",
+    "idle_update_status": "passed",
+    "original_credential_assertion_signature": "verified",
+    "browser_authentication": {
+      "result": "passed",
+      "method": "manual browser test",
+      "pin_required": true,
+      "gpio16_required": true,
+      "protocol_capture": false
+    }
+  },
+  "preservation": {
+    "efuse_operations": false,
+    "credential_store_reset": false,
+    "attestation_identity_replaced": false
+  },
+  "limits": [
+    "Acceptance applies to this signed image and normal S2 profile.",
+    "The full memory-fault and update-deadline matrix was not repeated.",
+    "The preceding runtime performed the installation; full update execution from this candidate was not tested.",
+    "Maximum-size images and electrically interrupted flash programming remain untested on hardware.",
+    "The earlier USB recovery incident remains unexplained.",
+    "This receipt records test evidence; it is not a signed device attestation or an independent assessment."
+  ]
+}

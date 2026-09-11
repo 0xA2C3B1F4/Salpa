@@ -1,0 +1,26 @@
+menu "RissoKey signed A/B bootloader"
+
+    config RISSOKEY_SIGNED_AB_BOOTLOADER
+        bool "Require the RissoKey signed A/B boot path"
+        default n
+
+    config RISSOKEY_UPDATE_KEY_DIGEST_HEX
+        string "Trusted RSA-3072 public-key digest"
+        depends on RISSOKEY_SIGNED_AB_BOOTLOADER
+        default ""
+        help
+            Lowercase 64-character SHA-256 digest in ESP Secure Boot V2 key
+            format. The host builder derives this public value from a PEM
+            public key. Private signing material must never enter this project.
+
+    config RISSOKEY_EFUSE_READ_ONLY
+        bool "Enforce the hardware version floor without programming eFuses"
+        depends on RISSOKEY_SIGNED_AB_BOOTLOADER && IDF_TARGET_ESP32S2
+        default n
+        help
+            For an already provisioned device. Keep ESP-IDF anti-rollback
+            checks, but block its automatic secure-version updates and the
+            ESP32-S2 eFuse programming backend. Counter advances and ROM
+            policy changes require a separate, explicitly approved operation.
+
+endmenu

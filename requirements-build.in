@@ -1,0 +1,4 @@
+# esptool's source distribution uses setuptools.build_meta.
+# Install these locked tools before requirements-dev.txt with --no-build-isolation.
+setuptools==84.0.0
+wheel==0.48.0
