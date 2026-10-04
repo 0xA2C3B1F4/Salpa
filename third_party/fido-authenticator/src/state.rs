@@ -271,6 +271,11 @@ pub struct PersistentState {
     // We could alternatively make all methods take a TrussedClient as parameter
     initialised: bool,
 
+    /// A failed write may already have reached storage. Do not trust either
+    /// the mutated RAM copy or a reload until a fresh authenticator is created.
+    #[serde(skip)]
+    persistence_failed: bool,
+
     credential_id_version: Option<CredentialIdVersion>,
     key_encryption_key: Option<KeyId>,
     key_wrapping_key: Option<KeyId>,
@@ -320,6 +325,7 @@ impl PersistentState {
     fn reset_value(config: &Config) -> Self {
         Self {
             initialised: false,
+            persistence_failed: false,
             key_encryption_key: None,
             key_wrapping_key: None,
             credential_id_version: config.credential_id_version,
@@ -386,17 +392,34 @@ impl PersistentState {
         Ok(())
     }
 
-    pub fn save<T: FilesystemClient>(&self, trussed: &mut T) -> Result<()> {
-        let mut data = Message::new();
-        cbor_smol::cbor_serialize_to(self, &mut data).unwrap();
+    pub(crate) fn persistence_failed(&self) -> bool {
+        self.persistence_failed
+    }
 
-        syscall!(trussed.write_file(
-            Location::Internal,
-            PathBuf::from(Self::FILENAME),
-            data,
-            None,
-        ));
-        Ok(())
+    pub(crate) fn latch_persistence_failure(&mut self) {
+        self.persistence_failed = true;
+    }
+
+    pub fn save<T: FilesystemClient>(&mut self, trussed: &mut T) -> Result<()> {
+        if self.persistence_failed {
+            return Err(Error::Other);
+        }
+        let result = (|| {
+            let mut data = Message::new();
+            cbor_smol::cbor_serialize_to(self, &mut data).map_err(|_| Error::Other)?;
+            try_syscall!(trussed.write_file(
+                Location::Internal,
+                PathBuf::from(Self::FILENAME),
+                data,
+                None,
+            ))
+            .map_err(|_| Error::Other)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.latch_persistence_failure();
+        }
+        result
     }
 
     pub fn reset<T: CryptoClient + FilesystemClient>(
@@ -404,11 +427,21 @@ impl PersistentState {
         trussed: &mut T,
         config: &Config,
     ) -> Result<()> {
-        if let Some(key) = self.key_encryption_key {
-            syscall!(trussed.delete(key));
+        if self.persistence_failed {
+            return Err(Error::Other);
         }
-        if let Some(key) = self.key_wrapping_key {
-            syscall!(trussed.delete(key));
+        let result = (|| {
+            if let Some(key) = self.key_encryption_key {
+                try_syscall!(trussed.delete(key)).map_err(|_| Error::Other)?;
+            }
+            if let Some(key) = self.key_wrapping_key {
+                try_syscall!(trussed.delete(key)).map_err(|_| Error::Other)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.latch_persistence_failure();
+            return result;
         }
         *self = Self::reset_value(config);
         self.initialised = true;
@@ -420,6 +453,9 @@ impl PersistentState {
         trussed: &mut T,
         config: &Config,
     ) -> Result<()> {
+        if self.persistence_failed {
+            return Err(Error::Other);
+        }
         if self.initialised {
             return Ok(());
         }
@@ -436,7 +472,10 @@ impl PersistentState {
                 Self::verify_initialization_marker(trussed)?;
                 let mut initial_state = Self::reset_value(config);
                 initial_state.initialised = true;
-                initial_state.save(trussed)?;
+                initial_state.save(trussed).map_err(|error| {
+                    self.latch_persistence_failure();
+                    error
+                })?;
                 Self::remove_initialization_marker(trussed)?;
                 initial_state
             }
@@ -749,15 +788,27 @@ impl RuntimeState {
         self.clear_credential_cache();
     }
 
+    /// Drop every authorization handle without contacting possibly failed
+    /// storage. Use only with the persistence latch or during reset, which
+    /// deletes all volatile keys. The latch blocks further CTAP use until reboot
+    /// releases unreachable volatile keys. Normal invalidation still deletes them.
+    pub fn discard_authorizations(&mut self) {
+        self.pin_protocol = None;
+        self.cached_rp = None;
+        self.cached_rk = None;
+        self.active_get_assertion = None;
+        self.clear_credential_cache();
+    }
+
     pub fn consume_token_user_presence(&mut self) {
         if let Some(protocol) = self.pin_protocol.as_mut() {
             protocol.consume_user_presence();
         }
     }
 
-    pub fn reset<T: CryptoClient + P256>(&mut self, trussed: &mut T) {
+    pub fn reset<T: CryptoClient>(&mut self, trussed: &mut T) -> Result<()> {
         // Could use `free_credential_heap`, but since we're deleting everything here, this is quicker.
-        syscall!(trussed.delete_all(Location::Volatile));
+        try_syscall!(trussed.delete_all(Location::Volatile)).map_err(|_| Error::Other)?;
         self.clear_credential_cache();
         self.active_get_assertion = None;
 
@@ -776,11 +827,10 @@ impl RuntimeState {
         // should drop with it.
         self.consecutive_pin_mismatches = 0;
 
-        if let Some(pin_protocol) = self.pin_protocol.take() {
-            pin_protocol.reset(trussed);
-        }
-        // to speed up future operations, we already generate the key agreement key
-        self.pin_protocol = Some(PinProtocolState::new(trussed));
+        // delete_all already removed the volatile protocol keys. Their handles
+        // must not survive reset; the next PIN request creates a fresh protocol.
+        self.pin_protocol = None;
+        Ok(())
     }
 }
 

@@ -128,7 +128,24 @@ class RecoveryTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(OBSERVER.argparse.ArgumentTypeError):
                 OBSERVER.positive_seconds(value)
 
-    def test_probe_only_reads_status_and_always_closes_on_mismatch(self):
+    def test_legacy_pms_command_requires_an_explicit_cli_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identity = Path(directory) / "identity.json"
+            identity.write_text("{}")
+            argv = ["--identity-reference", str(identity),
+                    "--output", str(Path(directory) / "evidence.jsonl"),
+                    "--firmware-version", "0.1.0", "--security-version", "5",
+                    "--iram-end", "0x40028000", "--data-start", "0x3ffb8000", "--worker"]
+            with patch.object(OBSERVER, "version", return_value="2.2.1"), patch.object(
+                    OBSERVER, "salpa_environment", return_value={}), patch.object(
+                    OBSERVER, "attempt", return_value=0) as attempt, patch.object(
+                    OBSERVER.sys, "stdout", io.StringIO()):
+                for flags, legacy in (([], False), (["--legacy-pms-command"], True)):
+                    with self.subTest(flags=flags):
+                        self.assertEqual(OBSERVER.main([*argv, *flags]), 0)
+                        self.assertIs(attempt.call_args.args[3].legacy_pms_command, legacy)
+
+    def test_probe_reads_only_status_with_default_or_explicit_legacy_pms_command(self):
         requests = []
         connection = SimpleNamespace(close=lambda: requests.append("close"))
         device = SimpleNamespace(
@@ -152,18 +169,34 @@ class RecoveryTests(unittest.TestCase):
             "memory_protection": SimpleNamespace(decode_status=lambda *a, **kw: None),
         }
         args = SimpleNamespace(security_version=5, firmware_version="0.1.0",
-                               iram_end=0x40028000, data_start=0x3ffb8000)
+                               iram_end=0x40028000, data_start=0x3ffb8000,
+                               legacy_pms_command=False)
         with patch.dict(OBSERVER.sys.modules, modules), patch.object(
                 OBSERVER, "load_tool", side_effect=lambda name, file:
                 security if name == "recovery_security" else updater):
-            OBSERVER.probe(object(), self.report, args)
-            self.assertEqual(requests, [(0x51, b"\x00"), (0x51, b"\x14"), "close"])
-            requests.clear()
-            policy["secure_boot_enabled"] = False
-            with self.assertRaises(ValueError):
-                OBSERVER.probe(object(), self.report, args)
-            self.assertEqual(requests, ["close"])
-            self.assertEqual(self.report.stage, "security_status")
+            for legacy, pms_request in ((False, b"\x16"), (True, b"\x14")):
+                with self.subTest(legacy=legacy):
+                    args.legacy_pms_command = legacy
+                    policy["secure_boot_enabled"] = True
+                    OBSERVER.probe(object(), self.report, args)
+                    self.assertEqual(requests, [(0x51, b"\x00"),
+                                                (0x51, pms_request), "close"])
+                    self.assertEqual(len(pms_request), 1)
+                    requests.clear()
+                    with patch.object(modules["memory_protection"], "decode_status",
+                                      side_effect=ValueError("PMS mismatch")):
+                        with self.assertRaises(ValueError):
+                            OBSERVER.probe(object(), self.report, args)
+                    self.assertEqual(requests, [(0x51, b"\x00"),
+                                                (0x51, pms_request), "close"])
+                    self.assertEqual(self.report.stage, "pms_status")
+                    requests.clear()
+                    policy["secure_boot_enabled"] = False
+                    with self.assertRaises(ValueError):
+                        OBSERVER.probe(object(), self.report, args)
+                    self.assertEqual(requests, ["close"])
+                    self.assertEqual(self.report.stage, "security_status")
+                    requests.clear()
 
 
 if __name__ == "__main__":

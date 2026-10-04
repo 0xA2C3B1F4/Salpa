@@ -49,6 +49,23 @@ and verifies that a rejected extra credential leaves the existing key usable.
 These tests exercise syscall boundaries; they do not substitute for physical
 power cuts inside flash programming or establish flash replay resistance.
 
+Persistent-state serialization and write failures return a CTAP error and
+latch that authenticator instance closed until reboot. The tests fail writes
+before and after their storage commit for PIN setup, change, retry decrement
+and retry reset in both PIN protocols. Previously issued tokens cannot approve
+later requests, including after the backend becomes writable again. A fresh
+platform must use the actual committed state, without retrying or restoring
+the failed RAM mutation. Maximum-sized RP-ID policy lists exercise serialization
+failure without a write. Credential error cleanup and invalid exclude/allow
+IDs also check that a failed lazy key-state save cannot be swallowed.
+
+Reset removes `rk-new`, `rk-transaction-new` and `rk-transaction` in addition
+to `rk/`. Reset regressions fail orphan cleanup and internal/volatile key
+deletion before and after commit, then require a new reset in a fresh virtual
+runtime. They check that resident credentials and PIN state are cleared while
+the synthetic special-ID attestation key and certificate remain byte-identical.
+No device identity is loaded or changed by these tests.
+
 A fake monotonic clock exercises GetNextAssertion at 29,999, 30,000, 30,001 and
 31,000 milliseconds, successful continuation refresh, clock reversal and clock
 failure. PIN-authorized continuations are covered for both PIN protocols.

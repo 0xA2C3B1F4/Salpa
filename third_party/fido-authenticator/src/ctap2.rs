@@ -287,6 +287,11 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
         if let Some(exclude_list) = &parameters.exclude_list {
             for descriptor in exclude_list.iter() {
                 let result = Credential::try_from(self, &rp_id_hash, descriptor);
+                // Parsing an unrecognized ID can lazily persist the KEK. An
+                // ambiguous persistence failure must not be treated as absence.
+                if self.state.persistent.persistence_failed() {
+                    return Err(Error::Other);
+                }
                 if let Ok(excluded_cred) = result {
                     use credential::CredentialProtectionPolicy;
                     // If UV is not performed, than CredProtectRequired credentials should not be visibile.
@@ -731,7 +736,8 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
         // even if the storage syscall reported an error after committing it.
         // Earlier failures can safely discard the new key.
         if make_credential_result.is_err() && !replacement_committed {
-            syscall!(self.trussed.delete(private_key));
+            // Preserve the original error even when storage is now offline.
+            let _ = try_syscall!(self.trussed.delete(private_key));
         }
         make_credential_result
     }
@@ -759,13 +765,38 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
         }
 
         // Invalidate volatile authorizations before any destructive state write.
-        self.state.runtime.invalidate_pin_tokens(&mut self.trussed);
+        // The reset's final delete_all removes volatile keys. Discard handles
+        // first without cleanup syscalls that could panic on a failed backend.
+        self.state.runtime.discard_authorizations();
 
-        // Delete resident keys
-        syscall!(self.trussed.delete_all(Location::Internal));
-        syscall!(self
-            .trussed
-            .remove_dir_all(Location::Internal, RK_DIR.into()));
+        // A storage error can follow a committed mutation. Stop this runtime
+        // instead of accepting cached security state after a partial reset.
+        let cleanup = (|| {
+            // Trussed preserves the special attestation key when deleting
+            // ordinary keys. Do not remove the client root or certificate tree.
+            try_syscall!(self.trussed.delete_all(Location::Internal)).map_err(|_| Error::Other)?;
+            try_syscall!(self
+                .trussed
+                .remove_dir_all(Location::Internal, RK_DIR.into()))
+            .map_err(|_| Error::Other)?;
+            // Replacement staging and journal files live outside rk/.
+            for path in [RK_STAGE, RK_JOURNAL_STAGE, RK_JOURNAL] {
+                let exists =
+                    try_syscall!(self.trussed.entry_metadata(Location::Internal, path.into()))
+                        .map_err(|_| Error::Other)?
+                        .metadata
+                        .is_some();
+                if exists {
+                    try_syscall!(self.trussed.remove_file(Location::Internal, path.into()))
+                        .map_err(|_| Error::Other)?;
+                }
+            }
+            Ok(())
+        })();
+        if cleanup.is_err() {
+            self.state.persistent.latch_persistence_failure();
+            return cleanup;
+        }
 
         // Delete large-blob array
         large_blobs::reset(&mut self.trussed);
@@ -776,7 +807,13 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
             .reset(&mut self.trussed, &self.config)?;
 
         // c. Reset runtime state
-        self.state.runtime.reset(&mut self.trussed);
+        self.state
+            .runtime
+            .reset(&mut self.trussed)
+            .map_err(|error| {
+                self.state.persistent.latch_persistence_failure();
+                error
+            })?;
 
         Ok(())
     }
@@ -1675,8 +1712,11 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
             // they probably meant to send None.
             if !allow_list.is_empty() {
                 for credential_id in allow_list {
-                    let mut credential = match Credential::try_from(self, rp_id_hash, credential_id)
-                    {
+                    let result = Credential::try_from(self, rp_id_hash, credential_id);
+                    if self.state.persistent.persistence_failed() {
+                        return Err(Error::Other);
+                    }
+                    let mut credential = match result {
                         Ok(credential) => credential,
                         _ => continue,
                     };
@@ -1828,8 +1868,7 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
             .unwrap_or(pin.len()) as u8;
         self.state
             .persistent
-            .set_pin_hash(&mut self.trussed, pin_hash, pin_code_point_length)
-            .unwrap();
+            .set_pin_hash(&mut self.trussed, pin_hash, pin_code_point_length)?;
 
         Ok(())
     }
@@ -2371,7 +2410,8 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
         // owned by the stored credential and must be kept). On success it was
         // already deleted above.
         if assertion_result.is_err() && !is_rk {
-            syscall!(self.trussed.delete(key));
+            // Preserve the original error even when storage is now offline.
+            let _ = try_syscall!(self.trussed.delete(key));
         }
         assertion_result
     }

@@ -6,7 +6,7 @@
 //! its IRAM alias. RTC fast/slow memory is non-executable. Locks reset on CPU
 //! restart; an incompatible inherited locked policy fails closed.
 
-pub const REQUEST: u8 = 0x14;
+pub const REQUEST: u8 = 0x16;
 pub const RESPONSE_SIZE: usize = 64;
 const SRAM_ALIAS_OFFSET: u32 = 0x70000;
 const MIN_IRAM_SPLIT: u32 = 0x4002_8000;

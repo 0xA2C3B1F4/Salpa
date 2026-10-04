@@ -9,6 +9,17 @@ trait Handlers {
     fn confirm_update(&mut self) -> bool;
 }
 
+fn first_diagnostic_response(
+    response: &mut [u8; 64],
+    maintenance: impl FnOnce(&mut [u8; 64]) -> Option<usize>,
+    preview: impl FnOnce(&mut [u8; 64]) -> Option<usize>,
+    memory: impl FnOnce(&mut [u8; 64]) -> Option<usize>,
+) -> Option<usize> {
+    maintenance(response)
+        .or_else(|| preview(response))
+        .or_else(|| memory(response))
+}
+
 fn dispatch(handlers: &mut impl Handlers, request: &[u8], response: &mut [u8; 64]) -> usize {
     let mut length = if let Some(length) = handlers.diagnostics(request, response) {
         length
@@ -48,39 +59,58 @@ impl<B: UpdateBackend> Handlers for S2Handlers<'_, B> {
     fn diagnostics(&mut self, request: &[u8], response: &mut [u8; 64]) -> Option<usize> {
         #[cfg(not(feature = "release-flash-encryption"))]
         let _ = (&request, &response);
-        #[cfg(feature = "security-epoch-maintenance")]
-        let maintenance_len = super::security_epoch_maintenance::handle(
-            request,
-            self.descriptor_address,
-            self.updater.phase(),
-            self.hardware,
-            self.wait_hook,
+        first_diagnostic_response(
             response,
-        );
-        #[cfg(not(feature = "security-epoch-maintenance"))]
-        let maintenance_len: Option<usize> = None;
-        #[cfg(any(
-            feature = "security-epoch-preview",
-            feature = "security-epoch-maintenance"
-        ))]
-        let preview_len = super::security_epoch_preview::handle(
-            request,
-            self.descriptor_address,
-            self.updater.phase(),
-            response,
-        );
-        #[cfg(not(any(
-            feature = "security-epoch-preview",
-            feature = "security-epoch-maintenance"
-        )))]
-        let preview_len: Option<usize> = None;
-        #[cfg(feature = "release-flash-encryption")]
-        let memory_len = (*request == [super::memory_protection::REQUEST])
-            .then(|| super::memory_protection::status(response));
-        #[cfg(not(feature = "release-flash-encryption"))]
-        let memory_len: Option<usize> = None;
-        // Preserve the original eager handler order and response selection.
-        maintenance_len.or(preview_len).or(memory_len)
+            |_response| {
+                #[cfg(feature = "security-epoch-maintenance")]
+                {
+                    super::security_epoch_maintenance::handle(
+                        request,
+                        self.descriptor_address,
+                        self.updater.phase(),
+                        self.hardware,
+                        self.wait_hook,
+                        _response,
+                    )
+                }
+                #[cfg(not(feature = "security-epoch-maintenance"))]
+                {
+                    None
+                }
+            },
+            |_response| {
+                #[cfg(any(
+                    feature = "security-epoch-preview",
+                    feature = "security-epoch-maintenance"
+                ))]
+                {
+                    super::security_epoch_preview::handle(
+                        request,
+                        self.descriptor_address,
+                        self.updater.phase(),
+                        _response,
+                    )
+                }
+                #[cfg(not(any(
+                    feature = "security-epoch-preview",
+                    feature = "security-epoch-maintenance"
+                )))]
+                {
+                    None
+                }
+            },
+            |_response| {
+                #[cfg(feature = "release-flash-encryption")]
+                {
+                    (*request == [super::memory_protection::REQUEST])
+                        .then(|| super::memory_protection::status(_response))
+                }
+                #[cfg(not(feature = "release-flash-encryption"))]
+                {
+                    None
+                }
+            },
+        )
     }
 
     fn security_status(&mut self, response: &mut [u8; 64]) -> usize {
@@ -166,6 +196,73 @@ mod tests {
             self.calls.push(("presence", vec![]));
             self.approved
         }
+    }
+
+    #[test]
+    fn diagnostic_selection_stops_after_maintenance_preview_or_memory_reply() {
+        let names = ["maintenance", "preview", "memory"];
+        let magic = [b"RKM1", b"RKE1", b"RKMP"];
+        for (lengths, selected) in [
+            ([Some(17), Some(23), Some(64)], Some(0)),
+            ([None, Some(23), Some(64)], Some(1)),
+            ([None, None, Some(64)], Some(2)),
+            ([None, None, None], None),
+        ] {
+            let calls = core::cell::RefCell::new(Vec::new());
+            let handler = |index: usize, response: &mut [u8; 64]| {
+                calls.borrow_mut().push(names[index]);
+                lengths[index].inspect(|_| response[..4].copy_from_slice(magic[index]))
+            };
+            let mut response = [0xa5; 64];
+            let length = first_diagnostic_response(
+                &mut response,
+                |response| handler(0, response),
+                |response| handler(1, response),
+                |response| handler(2, response),
+            );
+            assert_eq!(length, selected.and_then(|index| lengths[index]));
+            assert_eq!(calls.into_inner(), names[..selected.unwrap_or(2) + 1]);
+            if let Some(index) = selected {
+                assert_eq!(&response[..4], magic[index]);
+            } else {
+                assert_eq!(response, [0xa5; 64]);
+            }
+        }
+    }
+
+    #[test]
+    fn memory_status_has_a_distinct_code_and_cannot_satisfy_a_maintenance_plan() {
+        let memory_request = super::super::memory_protection::REQUEST;
+        assert_eq!(memory_request, 0x16);
+        assert!(
+            ![
+                super::super::security_status::REQUEST,
+                super::super::security_epoch_preview::REQUEST,
+                0x13,
+                0x14,
+                0x15,
+            ]
+            .contains(&memory_request)
+        );
+
+        let plan_digest = [7; 32];
+        for request in [&[memory_request][..], &[0x14][..]] {
+            assert_eq!(
+                super::super::security_epoch_plan::requested_images(request, &plan_digest),
+                None
+            );
+        }
+        let mut request = [7; 97];
+        request[0] = 0x14;
+        assert_eq!(
+            super::super::security_epoch_plan::requested_images(&request, &plan_digest),
+            Some(Some([[7; 32]; 2]))
+        );
+        request[0] = memory_request;
+        assert_eq!(
+            super::super::security_epoch_plan::requested_images(&request, &plan_digest),
+            None
+        );
     }
 
     #[test]

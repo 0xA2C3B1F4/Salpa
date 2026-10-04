@@ -55,9 +55,11 @@ and this initialization performs no flash, credential-store or eFuse writes.
 
 ## Read-only status
 
-Protected firmware accepts the exact one-byte request `0x14` on the existing
+Protected firmware accepts the exact one-byte request `0x16` on the existing
 CTAPHID vendor update command `0x51`. Extra request bytes are rejected by the
-normal command dispatcher. The 64-byte response contains:
+normal command dispatcher. The diagnostics dispatcher stops at the first
+handler that recognizes the request, preserving its response. The 64-byte
+response contains:
 
 | Bytes | Meaning |
 | --- | --- |
@@ -78,6 +80,16 @@ against the candidate boundaries. Protected runtime builds and CI invoke the
 ELF check automatically. A successful readback is evidence of configuration,
 not a substitute for
 controlled access-enforcement and availability tests.
+
+Earlier protected firmware used `0x14` for this status query. That code also
+belongs to the separate maintenance image's PROGRAM request. PROGRAM still
+requires exactly 97 bytes bound to the fixed plan and both image digests, plus
+fresh physical approval and requalification. A one-byte `0x14` is rejected by
+the maintenance handler. The updated dispatcher preserves its `RKM1` error.
+`tools/fido2-recovery-observer.py` uses `0x16` by default. Its explicit
+`--legacy-pms-command` option sends one byte, `0x14`, only for a known older
+normal image whose protocol was recorded during acceptance. The observer
+does not retry with the legacy code automatically.
 
 ## Stack guard and limitations
 

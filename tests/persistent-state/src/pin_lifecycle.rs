@@ -36,6 +36,13 @@ impl Clock {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FaultTarget {
+    StateWrite(usize),
+    RemoveFile(&'static littlefs2_core::Path),
+    DeleteAll(Location),
+}
+
 #[derive(Default)]
 struct StorageFault {
     count: usize,
@@ -43,6 +50,8 @@ struct StorageFault {
     at: Option<usize>,
     after: bool,
     offline: bool,
+    target: Option<FaultTarget>,
+    target_hits: usize,
 }
 
 struct ClockClient<C> {
@@ -73,7 +82,22 @@ impl<C: PollClient> PollClient for ClockClient<C> {
         {
             fault.commit_operation = Some(fault.count);
         }
-        let hit = mutation && fault.at == Some(fault.count);
+        let target_hit = match (&fault.target, &request) {
+            (Some(FaultTarget::StateWrite(_)), api::Request::WriteFile(write))
+                if write.path == littlefs2_core::path!("persistent-state.cbor").into() =>
+            {
+                fault.target_hits += 1;
+                matches!(fault.target, Some(FaultTarget::StateWrite(n)) if fault.target_hits == n)
+            }
+            (Some(FaultTarget::RemoveFile(path)), api::Request::RemoveFile(remove)) => {
+                remove.path == (*path).into()
+            }
+            (Some(FaultTarget::DeleteAll(location)), api::Request::DeleteAllKeys(delete)) => {
+                delete.location == *location
+            }
+            _ => false,
+        };
+        let hit = target_hit || (mutation && fault.at == Some(fault.count));
         if fault.offline || (hit && !fault.after) {
             fault.offline = true;
             self.fault_reply = true;
@@ -139,7 +163,24 @@ fn run_with_store(
     store: StoreConfig,
     test: impl FnOnce(&mut ClockClient<virt::Client<'_, Dispatcher>>, Clock),
 ) {
+    run_with_store_files(store, &[], test);
+}
+
+fn run_with_store_files(
+    store: StoreConfig,
+    files: &[(&littlefs2_core::Path, &[u8])],
+    test: impl FnOnce(&mut ClockClient<virt::Client<'_, Dispatcher>>, Clock),
+) {
+    use trussed::{platform::Platform as _, store::Store as _};
     virt::with_platform(store, |platform| {
+        for (path, data) in files {
+            platform
+                .store()
+                .ifs()
+                .create_dir_all(&path.parent().unwrap())
+                .unwrap();
+            platform.store().ifs().write(path, data).unwrap();
+        }
         platform.run_client_with_backends(
             "fido",
             Dispatcher::default(),
@@ -538,6 +579,7 @@ where
             Error::MissingParameter,
             Error::UnauthorizedPermission,
             Error::InvalidParameter,
+            Error::Other,
         ]
         .into_iter()
         .find(|error| *error as u8 == response[0])
@@ -579,6 +621,20 @@ fn set_or_change_pin<C: PollClient>(
 ) where
     ClockClient<C>: fido_authenticator::TrussedRequirements,
 {
+    assert!(store_pin_with_fault(client, auth, version, old, new, None).is_ok());
+}
+
+fn store_pin_with_fault<C: PollClient>(
+    client: &mut ClockClient<C>,
+    auth: &mut TestAuthenticator<C>,
+    version: PinProtocolVersion,
+    old: Option<&str>,
+    new: &str,
+    fault: Option<StorageFault>,
+) -> Result<(), Error>
+where
+    ClockClient<C>: fido_authenticator::TrussedRequirements,
+{
     use sha2::Digest;
     let (public, secret) = exchange(client, auth, version);
     let mut padded = [0; 64];
@@ -604,8 +660,14 @@ fn set_or_change_pin<C: PollClient>(
     request.new_pin_enc = Some((&encrypted[..]).into());
     request.pin_hash_enc = hash.as_ref().map(|hash| (&hash[..]).into());
     request.pin_auth = Some(signature.into());
-    assert!(client_pin(auth, &request).is_ok());
-    secret.delete(client);
+    if let Some(fault) = fault {
+        *client.fault.borrow_mut() = fault;
+    }
+    let result = client_pin(auth, &request).map(|_| ());
+    if !client.fault.borrow().offline {
+        secret.delete(client);
+    }
+    result
 }
 
 fn grant<C: PollClient>(
@@ -619,6 +681,21 @@ fn grant<C: PollClient>(
 where
     ClockClient<C>: fido_authenticator::TrussedRequirements,
 {
+    grant_with_fault(client, auth, version, pin, permissions, rp, None)
+}
+
+fn grant_with_fault<C: PollClient>(
+    client: &mut ClockClient<C>,
+    auth: &mut TestAuthenticator<C>,
+    version: PinProtocolVersion,
+    pin: &str,
+    permissions: u8,
+    rp: Option<&str>,
+    fault: Option<StorageFault>,
+) -> Result<Vec<u8>, Error>
+where
+    ClockClient<C>: fido_authenticator::TrussedRequirements,
+{
     use sha2::Digest;
     let (public, secret) = exchange(client, auth, version);
     let encrypted = secret.encrypt(client, &Sha256::digest(pin.as_bytes())[..16]);
@@ -627,13 +704,18 @@ where
     request.pin_hash_enc = Some((&encrypted[..]).into());
     request.permissions = Some(permissions);
     request.rp_id = rp;
+    if let Some(fault) = fault {
+        *client.fault.borrow_mut() = fault;
+    }
     let result = client_pin(auth, &request).map(|response| {
         secret
             .decrypt(client, &response.pin_token.unwrap())
             .unwrap()
             .to_vec()
     });
-    secret.delete(client);
+    if !client.fault.borrow().offline {
+        secret.delete(client);
+    }
     result
 }
 
@@ -945,12 +1027,48 @@ fn make_resident<C>(auth: &mut TestAuthenticator<C>, user: u8) -> Vec<u8>
 where
     ClockClient<C>: fido_authenticator::TrussedRequirements,
 {
+    make_credential(auth, user, true, false)
+}
+
+fn make_credential<C>(
+    auth: &mut TestAuthenticator<C>,
+    user: u8,
+    resident: bool,
+    invalid_exclude: bool,
+) -> Vec<u8>
+where
+    ClockClient<C>: fido_authenticator::TrussedRequirements,
+{
     // Synthetic RP/user and ES256, resident credential requested.
-    let mut request = vec![1, 0xa5, 1, 0x58, 32];
+    let mut request = vec![1, if invalid_exclude { 0xa6 } else { 0xa5 }, 1, 0x58, 32];
     request.extend_from_slice(&[0x42; 32]);
     request.extend_from_slice(b"\x02\xa1\x62id\x6bexample.com\x03\xa1\x62id\x41");
     request.push(user);
-    request.extend_from_slice(b"\x04\x81\xa2\x63alg\x26\x64type\x6apublic-key\x07\xa1\x62rk\xf5");
+    request.extend_from_slice(b"\x04\x81\xa2\x63alg\x26\x64type\x6apublic-key\x07\xa1\x62rk");
+    request.push(if resident { 0xf5 } else { 0xf4 });
+    if invalid_exclude {
+        request.extend_from_slice(b"\x05\x81\xa2\x62id\x41\x00\x64type\x6apublic-key");
+    }
+    command(auth, &request)
+}
+
+fn allowlist_assertion<C>(auth: &mut TestAuthenticator<C>, id: &[u8]) -> Vec<u8>
+where
+    ClockClient<C>: fido_authenticator::TrussedRequirements,
+{
+    let mut request = b"\x02\xa3\x01\x6bexample.com\x02\x58\x20".to_vec();
+    request.extend_from_slice(&[0x43; 32]);
+    request.extend_from_slice(b"\x03\x81\xa2\x62id");
+    if id.len() < 24 {
+        request.push(0x40 + id.len() as u8);
+    } else if id.len() < 256 {
+        request.extend_from_slice(&[0x58, id.len() as u8]);
+    } else {
+        request.push(0x59);
+        request.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    }
+    request.extend_from_slice(id);
+    request.extend_from_slice(b"\x64type\x6apublic-key");
     command(auth, &request)
 }
 
@@ -1038,6 +1156,430 @@ fn created_id(response: &[u8]) -> Vec<u8> {
         cbor_smol::cbor_deserialize(&response[1..]).unwrap();
     let length = u16::from_be_bytes(response.auth_data[53..55].try_into().unwrap()) as usize;
     response.auth_data[55..55 + length].to_vec()
+}
+
+fn filesystem_store(image: &std::path::Path) -> StoreConfig<'_> {
+    let mut config = StoreConfig::ram();
+    config.internal = virt::StorageConfig::filesystem(image.to_path_buf());
+    config
+}
+
+fn assert_latched<C: PollClient>(auth: &mut TestAuthenticator<C>, client: &mut ClockClient<C>)
+where
+    ClockClient<C>: fido_authenticator::TrussedRequirements,
+{
+    // The backend first remains offline, then becomes writable. Neither case
+    // may accept mutated RAM or perform a retry/automatic recovery write.
+    assert_eq!(command(auth, &[4]), [Error::Other as u8]);
+    *client.fault.borrow_mut() = StorageFault::default();
+    for request in [&[4][..], &[6, 0xa2, 1, 1, 2, 1][..], &[7][..]] {
+        assert_eq!(command(auth, request), [Error::Other as u8]);
+    }
+    assert_eq!(client.fault.borrow().count, 0);
+}
+
+#[test]
+fn pin_persistence_errors_stop_ctap_and_reboot_uses_only_committed_state() {
+    for version in [PinProtocolVersion::V1, PinProtocolVersion::V2] {
+        for operation in ["set", "change", "retry", "retry-reset"] {
+            for after in [false, true] {
+                let directory = tempfile::Builder::new()
+                    .prefix("salpa-pin-save-fault-")
+                    .tempdir_in(std::env::var_os("TMPDIR").unwrap())
+                    .unwrap();
+                let image = directory.path().join("internal.store");
+                run_with_store(filesystem_store(&image), |client, _| {
+                    let mut auth = authenticator(client);
+                    let mut existing_token = None;
+                    if operation != "set" {
+                        set_or_change_pin(client, &mut auth, version, None, "synthetic-old-pin");
+                        existing_token = Some(
+                            grant(client, &mut auth, version, "synthetic-old-pin", 4, None)
+                                .unwrap(),
+                        );
+                    }
+                    let fault = StorageFault {
+                        target: Some(FaultTarget::StateWrite(match operation {
+                            "change" => 3,
+                            "retry-reset" => 2,
+                            _ => 1,
+                        })),
+                        after,
+                        ..Default::default()
+                    };
+                    let result = match operation {
+                        "set" => store_pin_with_fault(
+                            client,
+                            &mut auth,
+                            version,
+                            None,
+                            "synthetic-new-pin",
+                            Some(fault),
+                        ),
+                        "change" => store_pin_with_fault(
+                            client,
+                            &mut auth,
+                            version,
+                            Some("synthetic-old-pin"),
+                            "synthetic-new-pin",
+                            Some(fault),
+                        ),
+                        _ => grant_with_fault(
+                            client,
+                            &mut auth,
+                            version,
+                            if operation == "retry" {
+                                "wrong-pin"
+                            } else {
+                                "synthetic-old-pin"
+                            },
+                            4,
+                            None,
+                            Some(fault),
+                        )
+                        .map(|_| ()),
+                    };
+                    assert_eq!(result, Err(Error::Other), "{operation}, after={after}");
+                    assert!(client.fault.borrow().offline);
+                    // Existing issued tokens must not turn failed cleanup into
+                    // a panic, or authorize the next request when I/O returns.
+                    if let Some(token) = existing_token {
+                        let sig = signature(&token, version, &[1]);
+                        assert_eq!(metadata(&mut auth, version, &sig), Error::Other as u8);
+                    }
+                    assert_latched(&mut auth, client);
+                });
+                // A fresh platform has no cached RAM or volatile authorization.
+                run_with_store(filesystem_store(&image), |client, _| {
+                    let mut auth = reopen(client);
+                    let pin_is_set = !(operation == "set" && !after);
+                    let info = command(&mut auth, &[4]);
+                    let info: ctap_types::ctap2::get_info::Response =
+                        cbor_smol::cbor_deserialize(&info[1..]).unwrap();
+                    assert_eq!(info.options.unwrap().client_pin, Some(pin_is_set));
+                    let retries = if (operation == "retry" && after)
+                        || (operation == "retry-reset" && !after)
+                    {
+                        7
+                    } else {
+                        8
+                    };
+                    assert_eq!(
+                        client_pin(&mut auth, &pin_request(version, 1))
+                            .unwrap()
+                            .retries,
+                        Some(retries),
+                    );
+                    if pin_is_set {
+                        let committed_new = after && matches!(operation, "set" | "change");
+                        let accepted = if committed_new {
+                            "synthetic-new-pin"
+                        } else {
+                            "synthetic-old-pin"
+                        };
+                        assert!(grant(client, &mut auth, version, accepted, 4, None).is_ok());
+                        let rejected = if committed_new {
+                            "synthetic-old-pin"
+                        } else {
+                            "synthetic-new-pin"
+                        };
+                        assert_eq!(
+                            grant(client, &mut auth, version, rejected, 4, None),
+                            Err(Error::PinInvalid),
+                        );
+                    } else {
+                        set_or_change_pin(client, &mut auth, version, None, "fresh-pin");
+                        assert!(grant(client, &mut auth, version, "fresh-pin", 4, None).is_ok());
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn serialization_failure_latches_state_without_writing_or_loading_defaults() {
+    use ctap_types::ctap2::config::{MAX_MIN_PIN_LENGTH_RP_IDS, MAX_RP_ID_LENGTH};
+    use trussed_core::FilesystemClient;
+    run(|client, _| {
+        drop(authenticator(client));
+        let config = fido_authenticator::Config::new(1024);
+        let mut state = fido_authenticator::state::PersistentState::default();
+        state.load_if_not_initialised(client, &config).unwrap();
+        let path = littlefs2_core::path!("persistent-state.cbor");
+        let before = syscall!(client.read_file(Location::Internal, path.into())).data;
+        let mut rp_ids = heapless::Vec::new();
+        for _ in 0..MAX_MIN_PIN_LENGTH_RP_IDS {
+            let mut rp = heapless::String::<MAX_RP_ID_LENGTH>::new();
+            for _ in 0..MAX_RP_ID_LENGTH {
+                rp.push('a').unwrap();
+            }
+            rp_ids.push(rp).unwrap();
+        }
+        client.fault.borrow_mut().count = 0;
+        assert_eq!(
+            state.set_min_pin_length_rp_ids(client, rp_ids),
+            Err(Error::Other)
+        );
+        assert_eq!(client.fault.borrow().count, 0);
+        assert_eq!(
+            state.load_if_not_initialised(client, &config),
+            Err(Error::Other)
+        );
+        assert_eq!(state.save(client), Err(Error::Other));
+        assert_eq!(client.fault.borrow().count, 0);
+        assert_eq!(
+            syscall!(client.read_file(Location::Internal, path.into())).data,
+            before
+        );
+        let mut rebooted = fido_authenticator::state::PersistentState::default();
+        rebooted.load_if_not_initialised(client, &config).unwrap();
+        assert!(rebooted.min_pin_length_rp_ids().is_empty());
+    });
+}
+
+#[test]
+fn initial_state_write_failure_latches_the_original_uninitialized_state() {
+    use trussed_core::FilesystemClient;
+    for after in [false, true] {
+        run(|client, _| {
+            syscall!(
+                client.write_file(
+                    Location::Internal,
+                    littlefs2_core::path!("persistent-state.init").into(),
+                    fido_authenticator::state::PersistentState::INITIALIZATION_MARKER
+                        .try_into()
+                        .unwrap(),
+                    None,
+                )
+            );
+            let config = fido_authenticator::Config::new(1024);
+            let mut state = fido_authenticator::state::PersistentState::default();
+            *client.fault.borrow_mut() = StorageFault {
+                target: Some(FaultTarget::StateWrite(1)),
+                after,
+                ..Default::default()
+            };
+            assert_eq!(
+                state.load_if_not_initialised(client, &config),
+                Err(Error::Other)
+            );
+            *client.fault.borrow_mut() = StorageFault::default();
+            assert_eq!(
+                state.load_if_not_initialised(client, &config),
+                Err(Error::Other)
+            );
+            assert_eq!(client.fault.borrow().count, 0);
+            let mut rebooted = fido_authenticator::state::PersistentState::default();
+            rebooted.load_if_not_initialised(client, &config).unwrap();
+        });
+    }
+}
+
+#[test]
+fn credential_save_and_nonresident_error_cleanup_do_not_panic_when_storage_is_offline() {
+    for assertion in [false, true] {
+        for after in [false, true] {
+            run(|client, _| {
+                let mut auth = authenticator(client);
+                let credential_id = if assertion {
+                    Some(created_id(&make_credential(&mut auth, 7, false, false)))
+                } else {
+                    None
+                };
+                *client.fault.borrow_mut() = StorageFault {
+                    target: Some(FaultTarget::StateWrite(1)),
+                    after,
+                    ..Default::default()
+                };
+                let response = if let Some(id) = credential_id {
+                    allowlist_assertion(&mut auth, &id)
+                } else {
+                    make_credential(&mut auth, 7, false, false)
+                };
+                assert_eq!(response, [Error::Other as u8]);
+                assert!(client.fault.borrow().offline);
+                assert_latched(&mut auth, client);
+            });
+        }
+    }
+}
+
+#[test]
+fn invalid_credential_ids_cannot_hide_a_lazy_key_state_save_failure() {
+    for exclude in [false, true] {
+        for after in [false, true] {
+            run(|client, _| {
+                let mut auth = authenticator(client);
+                *client.fault.borrow_mut() = StorageFault {
+                    target: Some(FaultTarget::StateWrite(1)),
+                    after,
+                    ..Default::default()
+                };
+                let response = if exclude {
+                    make_credential(&mut auth, 7, false, true)
+                } else {
+                    allowlist_assertion(&mut auth, &[0])
+                };
+                assert_eq!(response, [Error::Other as u8]);
+                assert!(client.fault.borrow().offline);
+                assert_latched(&mut auth, client);
+            });
+        }
+        // Ordinary unrecognized credential IDs retain their existing behavior.
+        run(|client, _| {
+            let mut auth = authenticator(client);
+            if exclude {
+                assert_eq!(make_credential(&mut auth, 7, false, true)[0], 0);
+            } else {
+                assert_eq!(
+                    allowlist_assertion(&mut auth, &[0]),
+                    [Error::NoCredentials as u8]
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn reset_removes_orphan_replacement_files_and_preserves_attestation_after_failures() {
+    use trussed::{
+        key::{Flags, Key, Kind},
+        platform::Platform as _,
+        store::Store as _,
+    };
+    use trussed_core::{
+        CertificateClient, FilesystemClient,
+        types::{CertId, KeyId, Mechanism},
+    };
+    // This synthetic test identity has no relationship to any device identity.
+    let key = Key {
+        flags: Flags::SENSITIVE,
+        kind: Kind::P256,
+        material: [1; 32].as_slice().try_into().unwrap(),
+    }
+    .serialize();
+    let mut certificate = vec![
+        0x06, 0x0b, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xe5, 0x1c, 0x01, 0x01, 0x04, 0x04, 0x12,
+        0x04, 0x10,
+    ];
+    certificate.extend_from_slice(&[0xa5; 16]);
+    let key_path = littlefs2_core::path!("fido/sec/00");
+    let cert_path = littlefs2_core::path!("fido/x5c/00");
+    for target in [
+        None,
+        Some(FaultTarget::RemoveFile(littlefs2_core::path!("rk-new"))),
+        Some(FaultTarget::RemoveFile(littlefs2_core::path!(
+            "rk-transaction-new"
+        ))),
+        Some(FaultTarget::DeleteAll(Location::Internal)),
+        Some(FaultTarget::DeleteAll(Location::Volatile)),
+    ] {
+        for after in [false, true] {
+            let directory = tempfile::Builder::new()
+                .prefix("salpa-reset-fault-")
+                .tempdir_in(std::env::var_os("TMPDIR").unwrap())
+                .unwrap();
+            let image = directory.path().join("internal.store");
+            run_with_store_files(
+                filesystem_store(&image),
+                &[(key_path, key.as_slice()), (cert_path, &certificate)],
+                |client, _| {
+                    let mut auth = authenticator(client);
+                    assert_eq!(make_resident(&mut auth, 7)[0], 0);
+                    set_or_change_pin(client, &mut auth, PinProtocolVersion::V2, None, "reset-pin");
+                    let token = grant(
+                        client,
+                        &mut auth,
+                        PinProtocolVersion::V2,
+                        "reset-pin",
+                        4,
+                        None,
+                    )
+                    .unwrap();
+                    for path in [
+                        littlefs2_core::path!("rk-new"),
+                        littlefs2_core::path!("rk-transaction-new"),
+                    ] {
+                        syscall!(client.write_file(
+                            Location::Internal,
+                            path.into(),
+                            b"synthetic-orphan".as_slice().try_into().unwrap(),
+                            None,
+                        ));
+                    }
+                    *client.fault.borrow_mut() = StorageFault {
+                        target,
+                        after,
+                        ..Default::default()
+                    };
+                    let response = command(&mut auth, &[7]);
+                    if target.is_some() {
+                        assert_eq!(response, [Error::Other as u8]);
+                        assert!(client.fault.borrow().offline);
+                        let sig = signature(&token, PinProtocolVersion::V2, &[1]);
+                        assert_eq!(
+                            metadata(&mut auth, PinProtocolVersion::V2, &sig),
+                            Error::Other as u8
+                        );
+                        assert_latched(&mut auth, client);
+                    } else {
+                        assert_eq!(response, [0]);
+                    }
+                },
+            );
+            // Resume with fresh physical approval in a fresh virtual runtime.
+            run_with_store(filesystem_store(&image), |client, _| {
+                let mut auth = reopen(client);
+                assert_eq!(command(&mut auth, &[7]), [0]);
+                for path in [
+                    littlefs2_core::path!("rk-new"),
+                    littlefs2_core::path!("rk-transaction-new"),
+                    littlefs2_core::path!("rk-transaction"),
+                    littlefs2_core::path!("rk"),
+                ] {
+                    assert!(
+                        syscall!(client.entry_metadata(Location::Internal, path.into()))
+                            .metadata
+                            .is_none()
+                    );
+                }
+                assert_eq!(resident_assertion(&mut auth), [Error::NoCredentials as u8]);
+                let info = command(&mut auth, &[4]);
+                let info: ctap_types::ctap2::get_info::Response =
+                    cbor_smol::cbor_deserialize(&info[1..]).unwrap();
+                assert_eq!(info.options.unwrap().client_pin, Some(false));
+                assert_eq!(info.aaguid.as_slice(), &[0xa5; 16]);
+                assert!(syscall!(client.exists(Mechanism::P256, KeyId::from_special(0))).exists);
+                assert_eq!(
+                    syscall!(client.read_certificate(CertId::from_special(0)))
+                        .der
+                        .as_slice(),
+                    certificate
+                );
+            });
+            virt::with_platform(filesystem_store(&image), |platform| {
+                assert_eq!(
+                    platform
+                        .store()
+                        .ifs()
+                        .read::<heapless_bytes::Bytes<64>>(key_path)
+                        .unwrap()
+                        .as_slice(),
+                    key.as_slice()
+                );
+                assert_eq!(
+                    platform
+                        .store()
+                        .ifs()
+                        .read::<heapless_bytes::Bytes<64>>(cert_path)
+                        .unwrap()
+                        .as_slice(),
+                    certificate
+                );
+            });
+        }
+    }
 }
 
 #[test]

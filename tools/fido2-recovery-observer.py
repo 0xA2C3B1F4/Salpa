@@ -143,7 +143,8 @@ def probe(descriptor, report, args):
             raise ValueError("normal idle image mismatch")
         report.emit("checked", normal_idle_image_matches=True)
         report.enter("pms_status")
-        decode_pms(device.call(0x51, b"\x14"), iram_end=args.iram_end,
+        pms_request = b"\x14" if args.legacy_pms_command else b"\x16"
+        decode_pms(device.call(0x51, pms_request), iram_end=args.iram_end,
                    data_start=args.data_start)
         report.emit("checked", pms_matches=True)
         report.enter("get_info")
@@ -221,6 +222,8 @@ def main(argv=None):
     parser.add_argument("--security-version", type=int, required=True)
     parser.add_argument("--iram-end", type=lambda value: int(value, 0), required=True)
     parser.add_argument("--data-start", type=lambda value: int(value, 0), required=True)
+    parser.add_argument("--legacy-pms-command", action="store_true",
+                        help="use one-byte 0x14 only for known older normal firmware")
     parser.add_argument("--wait-for-disconnect", action="store_true")
     parser.add_argument("--wait-seconds", type=positive_seconds, default=120)
     parser.add_argument("--settle-seconds", type=positive_seconds, default=2)

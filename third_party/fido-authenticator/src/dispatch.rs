@@ -99,17 +99,17 @@ where
     T: TrussedRequirements,
     UP: UserPresence,
 {
-    authenticator
-        .state
-        .runtime
-        .observe_pin_tokens(&mut authenticator.trussed);
-
     // Annoyance: We can't load in fido-authenticator constructor.
     authenticator
         .state
         .persistent
         .load_if_not_initialised(&mut authenticator.trussed, &authenticator.config)
         .map_err(|_| Status::UnspecifiedPersistentExecutionError)?;
+
+    authenticator
+        .state
+        .runtime
+        .observe_pin_tokens(&mut authenticator.trussed);
 
     // let command = apdu_dispatch::Command::try_from(data)
     //     .map_err(|_| Status::IncorrectDataParameter)?;
@@ -122,7 +122,11 @@ where
     // Goal of these nested scopes is to keep stack small.
     let ctap_response = {
         let ctap_request = ctap1::Request::try_from(command)?;
-        ctap1::Authenticator::call_ctap1(authenticator, &ctap_request)?
+        let result = ctap1::Authenticator::call_ctap1(authenticator, &ctap_request);
+        if authenticator.state.persistent.persistence_failed() {
+            authenticator.state.runtime.discard_authorizations();
+        }
+        result?
     };
     // debug!("1b SP: {:X}", msp());
 
@@ -171,17 +175,17 @@ where
     T: TrussedRequirements,
     UP: UserPresence,
 {
-    authenticator
-        .state
-        .runtime
-        .observe_pin_tokens(&mut authenticator.trussed);
-
     // Annoyance: We can't load in fido-authenticator constructor.
     authenticator
         .state
         .persistent
         .load_if_not_initialised(&mut authenticator.trussed, &authenticator.config)
         .map_err(|error| error as u8)?;
+
+    authenticator
+        .state
+        .runtime
+        .observe_pin_tokens(&mut authenticator.trussed);
     authenticator
         .recover_resident_replacement()
         .map_err(|error| error as u8)?;
@@ -204,12 +208,16 @@ where
         })?;
     debug!("2a SP: {:X}", msp());
     use ctap2::Authenticator;
-    authenticator
+    let result = authenticator
         .call_ctap2(&ctap_request, ctap_response)
         .map_err(|error| {
             info!("CTAP2 error: {:?}", error);
             error as u8
-        })
+        });
+    if authenticator.state.persistent.persistence_failed() {
+        authenticator.state.runtime.discard_authorizations();
+    }
+    result
 }
 
 #[allow(unused)]

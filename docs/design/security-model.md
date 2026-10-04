@@ -29,6 +29,11 @@ an attacker with physical possession.
 - Missing, unreadable, or malformed `persistent-state.cbor` fails closed at the
   CTAP boundary. Normal firmware never replaces it with default PIN, retry,
   `alwaysUv`, counter, or key-reference state.
+- A failed persistent-state save or resident-credential cleanup during reset
+  blocks further CTAP requests in that runtime and discards cached
+  authorizations. The device must restart before using the persisted state
+  again; startup still rejects missing or malformed state. The separate
+  signed-update path remains available.
 - Only an explicit provisioning image may authorize first state creation by
   writing a one-time marker. The authenticator saves valid initial state before
   it removes that marker.

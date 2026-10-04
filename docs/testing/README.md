@@ -184,6 +184,13 @@ The tool requires an exact VID, PID and serial match, but does not log those
 values or raw error messages. Each run creates a new private JSONL file outside
 the source tree.
 
+PMS readback uses the one-byte `0x16` request. For a previously accepted normal
+image whose recorded protocol uses `0x14`, add `--legacy-pms-command`. This
+option sends exactly one byte and is only for that known older image. Do not
+use it for an unknown or maintenance image. There is no automatic fallback
+to `0x14`, which remains the maintenance PROGRAM code with its separate
+97-byte plan binding and physical approval requirements.
+
 For a manual cycle, add `--wait-for-disconnect`. Wait until the record shows
 `wait_disconnect` with one matching device before operating the board. The
 tool must observe disappearance and then two seconds of stable sampled
