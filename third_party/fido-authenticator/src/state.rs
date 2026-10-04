@@ -785,19 +785,28 @@ impl RuntimeState {
         self.cached_credentials.push(credential);
     }
 
+    /// A storage read error ends the assertion continuation with a CTAP error
+    /// instead of panicking. An undecodable record is still treated as absent.
     pub fn pop_credential<T: FilesystemClient>(
         &mut self,
         trussed: &mut T,
-    ) -> Option<FullCredential> {
-        let cached_credential = self.cached_credentials.pop()?;
+    ) -> Result<Option<FullCredential>> {
+        let Some(cached_credential) = self.cached_credentials.pop() else {
+            return Ok(None);
+        };
 
-        let credential_data = syscall!(trussed.read_file(
-            Location::Internal,
-            PathBuf::try_from(cached_credential.path.as_str()).unwrap(),
-        ))
-        .data;
-
-        FullCredential::deserialize(&credential_data).ok()
+        let read = PathBuf::try_from(cached_credential.path.as_str())
+            .map_err(|_| Error::Other)
+            .and_then(|path| {
+                try_syscall!(trussed.read_file(Location::Internal, path)).map_err(|_| Error::Other)
+            });
+        match read {
+            Ok(reply) => Ok(FullCredential::deserialize(&reply.data).ok()),
+            Err(error) => {
+                self.clear_credential_continuations();
+                Err(error)
+            }
+        }
     }
 
     pub fn remaining_credentials(&self) -> u32 {

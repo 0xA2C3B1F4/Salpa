@@ -128,7 +128,6 @@ src/platform/storage_init.rs
 src/platform/storage_layout.rs
 src/platform/usb_runtime.rs
 src/platform/usb_update.rs
-src/platform/user_presence.rs
 src/platform/vendor_commands.rs
 src/request_completion.rs
 src/signed_image.rs

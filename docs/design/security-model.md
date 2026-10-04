@@ -41,9 +41,10 @@ an attacker with physical possession.
   after an interrupted operation. An error can follow a completed mutation;
   interrupted cleanup can leave key files until a successful reset. A failed
   deletion is not proof of key erasure or credential revocation after reboot.
-- Credential-management read errors return a CTAP error and clear credential
-  continuations. They do not mark a persistent mutation as failed; a fresh
-  enumeration can proceed once storage reads work again.
+- Credential-management and discoverable-credential assertion read errors
+  return a CTAP error and clear credential continuations, including any
+  pending GetNextAssertion. They do not mark a persistent mutation as failed;
+  a fresh enumeration or assertion can proceed once storage reads work again.
 - Only an explicit provisioning image may authorize first state creation by
   writing a one-time marker. The authenticator saves valid initial state before
   it removes that marker.

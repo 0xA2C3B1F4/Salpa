@@ -106,3 +106,9 @@ key reference, verify the other key kind is preserved, rotate successfully,
 and perform a nonresident credential creation and assertion. Generation or
 cleanup failures may leave unreferenced key files; the test does not claim
 that the multi-operation rotation is transactional.
+
+Discoverable-credential assertions fail directory reads, the first-entry and
+next-entry credential reads while building the cache, the read that returns
+the first assertion, and the GetNextAssertion read. Each case must return
+`Other` without panicking and leave no continuation; after I/O is restored a
+fresh assertion and GetNextAssertion succeed without a reboot.

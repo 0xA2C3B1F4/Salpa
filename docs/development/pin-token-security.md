@@ -50,7 +50,9 @@ was changed by this work.
 
 ## Provenance and reproducible tests
 
-The pinned base is `fae4a1ec8f55d9abe53a7405faf310ef90f3eb71`.
+The pinned base is SoloKeys fork commit
+`fae4a1ec8f55d9abe53a7405faf310ef90f3eb71`
+(<https://github.com/solokeys/fido-authenticator>).
 On 2026-09-06 upstream main was
 `e342447aaf2c7fc1b761f4ab78c1ab248857875a`; its
 [PIN module](https://github.com/trussed-dev/fido-authenticator/blob/e342447aaf2c7fc1b761f4ab78c1ab248857875a/src/ctap2/pin.rs)

@@ -234,7 +234,7 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
         let credential = self
             .state
             .runtime
-            .pop_credential(&mut self.trussed)
+            .pop_credential(&mut self.trussed)?
             .ok_or(Error::NotAllowed)?;
 
         // 5. suppress PII if no UV was performed in original GA
@@ -1772,22 +1772,33 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
         self.prepare_cache(rp_id_hash, uv_performed)?;
 
         let num_credentials = self.state.runtime.remaining_credentials();
-        let credential = self.state.runtime.pop_credential(&mut self.trussed);
+        let credential = self.state.runtime.pop_credential(&mut self.trussed)?;
         Ok(credential.map(|credential| (Credential::Full(credential), num_credentials)))
     }
 
     /// Populate the cache with the RP credentials.
     #[inline(never)]
     fn prepare_cache(&mut self, rp_id_hash: &[u8; 32], uv_performed: bool) -> Result<()> {
+        // A storage read error must not leave a partially filled cache behind
+        // for GetNextAssertion, and must not panic the firmware.
+        let result = self.prepare_cache_inner(rp_id_hash, uv_performed);
+        if result.is_err() {
+            self.state.runtime.clear_credential_continuations();
+        }
+        result
+    }
+
+    fn prepare_cache_inner(&mut self, rp_id_hash: &[u8; 32], uv_performed: bool) -> Result<()> {
         use crate::state::CachedCredential;
         use core::str::FromStr;
 
         let file_name_prefix = rp_file_name_prefix(rp_id_hash);
-        let mut maybe_entry = syscall!(self.trussed.read_dir_first_alphabetical(
+        let mut maybe_entry = try_syscall!(self.trussed.read_dir_first_alphabetical(
             Location::Internal,
             PathBuf::from(RK_DIR),
             Some(file_name_prefix.clone())
         ))
+        .map_err(|_| Error::Other)?
         .entry;
 
         while let Some(entry) = maybe_entry.take() {
@@ -1806,9 +1817,10 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
                 return Err(Error::Other);
             }
 
-            let credential_data = syscall!(self
+            let credential_data = try_syscall!(self
                 .trussed
                 .read_file(Location::Internal, entry.path().into(),))
+            .map_err(|_| Error::Other)?
             .data;
 
             let credential = FullCredential::deserialize(&credential_data).map_err(|_err| {
@@ -1826,7 +1838,9 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
                 });
             }
 
-            maybe_entry = syscall!(self.trussed.read_dir_next()).entry;
+            maybe_entry = try_syscall!(self.trussed.read_dir_next())
+                .map_err(|_| Error::Other)?
+                .entry;
         }
         Ok(())
     }

@@ -244,10 +244,6 @@ needed for littlefs calls in the Xtensa memory layout.
 The pure state machines can be tested without a repository build directory:
 
 ```sh
-rustc --edition=2024 --test src/platform/user_presence.rs \
-  -o "$TMPDIR/rissokey-user-presence-tests"
-"$TMPDIR/rissokey-user-presence-tests"
-
 rustc --edition=2024 --test src/platform/rng_health.rs \
   -o "$TMPDIR/rissokey-rng-health-tests"
 "$TMPDIR/rissokey-rng-health-tests"
@@ -265,9 +261,10 @@ rustc --edition=2024 --test src/identity.rs \
 "$TMPDIR/rissokey-identity-tests"
 ```
 
-The current counts are five user-presence tests, five development identity
-tests, and three tests each for RNG sanity, partition ranges, and the
-destructive provisioning gesture.
+The current counts are five development identity tests, and three tests each
+for RNG sanity, partition ranges, and the destructive provisioning gesture.
+Button-presence state machines are tested with the crate's host unit tests
+(`presence_gate` and `maintenance_presence`).
 
 Run the physical credential-persistence probe only in a protected temporary
 directory. `create` and `assert` each require a fresh BOOT-button press:

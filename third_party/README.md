@@ -13,8 +13,12 @@ Sources:
   `2ea719b28245f0e68960e99aab16131f7f14d8ff`
 - `ref-swap` 0.1.2, crates.io package, upstream commit
   `f8a5c15a385e1658947ba74d865b14495e3b37d3`
-- `fido-authenticator` 0.4.0-rc.3, upstream commit
-  `fae4a1ec8f55d9abe53a7405faf310ef90f3eb71`
+- `fido-authenticator` 0.4.0-rc.3 from the SoloKeys fork
+  <https://github.com/solokeys/fido-authenticator>, commit
+  `fae4a1ec8f55d9abe53a7405faf310ef90f3eb71` (adds ML-DSA-44 on top of
+  trussed-dev/fido-authenticator `e342447aaf2c7fc1b761f4ab78c1ab248857875a`).
+  The commit is not in trussed-dev/fido-authenticator; the vendored
+  `Cargo.toml` keeps the upstream `repository` metadata unchanged.
 
 The first three crates contain portability changes limited to atomic imports,
 dependency declarations, the deprecated `compare_and_swap` shim, and one
@@ -36,3 +40,10 @@ checks, and uses `subtle` for secret comparisons. Credential-management HMAC
 failure no longer decrements PIN retries. The storage format is unchanged.
 See [PIN-token review and provenance](../docs/development/pin-token-security.md)
 for the upstream revision checked, specification references and test scope.
+
+Later local `fido-authenticator` changes journal resident-credential
+replacement, remove its staging files on reset, latch the runtime closed after
+a failed persistent-state or credential write, and return CTAP errors instead
+of panicking on storage errors in credential management, key rotation and
+discoverable-credential assertions. Compare against the SoloKeys base above to
+review the complete local patch.

@@ -1933,6 +1933,66 @@ fn resident_lookup_read_errors_preserve_existing_credentials() {
     }
 }
 
+fn assertion_response(response: &[u8]) -> ctap_types::ctap2::get_assertion::Response {
+    assert_eq!(response[0], 0);
+    cbor_smol::cbor_deserialize(&response[1..]).unwrap()
+}
+
+#[test]
+fn discoverable_assertion_read_errors_end_without_a_continuation() {
+    // With two discoverable credentials, building the cache reads rk files 1
+    // and 2. Returning the first assertion reads one of them again (read 3).
+    for target in [
+        FaultTarget::ReadDirFirst,
+        FaultTarget::ReadDirNext(1),
+        FaultTarget::CredentialRead(1),
+        FaultTarget::CredentialRead(2),
+        FaultTarget::CredentialRead(3),
+    ] {
+        run(|client, _| {
+            let mut auth = authenticator(client);
+            assert_eq!(make_resident(&mut auth, 7)[0], 0);
+            assert_eq!(make_resident(&mut auth, 8)[0], 0);
+            *client.fault.borrow_mut() = StorageFault {
+                target: Some(target),
+                ..Default::default()
+            };
+            assert_eq!(resident_assertion(&mut auth), [Error::Other as u8]);
+            assert!(client.fault.borrow().offline);
+            // Restore I/O. A failed read is not a persistence failure, so the
+            // runtime stays usable, but no partial cache may be continued.
+            *client.fault.borrow_mut() = StorageFault::default();
+            assert_eq!(command(&mut auth, &[8]), [Error::NotAllowed as u8]);
+            let first = assertion_response(&resident_assertion(&mut auth));
+            assert_eq!(first.number_of_credentials, Some(2));
+            assert_eq!(command(&mut auth, &[8])[0], 0);
+        });
+    }
+}
+
+#[test]
+fn next_assertion_read_error_ends_the_continuation() {
+    run(|client, _| {
+        let mut auth = authenticator(client);
+        assert_eq!(make_resident(&mut auth, 7)[0], 0);
+        assert_eq!(make_resident(&mut auth, 8)[0], 0);
+        let first = assertion_response(&resident_assertion(&mut auth));
+        assert_eq!(first.number_of_credentials, Some(2));
+        // A fresh fault counter: the next rk read is GetNextAssertion's.
+        *client.fault.borrow_mut() = StorageFault {
+            target: Some(FaultTarget::CredentialRead(1)),
+            ..Default::default()
+        };
+        assert_eq!(command(&mut auth, &[8]), [Error::Other as u8]);
+        assert!(client.fault.borrow().offline);
+        *client.fault.borrow_mut() = StorageFault::default();
+        assert_eq!(command(&mut auth, &[8]), [Error::NotAllowed as u8]);
+        let again = assertion_response(&resident_assertion(&mut auth));
+        assert_eq!(again.number_of_credentials, Some(2));
+        assert_eq!(command(&mut auth, &[8])[0], 0);
+    });
+}
+
 #[test]
 fn credential_management_mutations_discard_continuations_but_keep_the_pin_grant() {
     for version in [PinProtocolVersion::V1, PinProtocolVersion::V2] {

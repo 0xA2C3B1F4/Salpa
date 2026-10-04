@@ -75,7 +75,7 @@ Exact upstream revisions:
 
 | Crate | Revision or version | ESP32-S3 result |
 | --- | --- | --- |
-| `fido-authenticator` | upstream `fae4a1ec8f55d9abe53a7405faf310ef90f3eb71`, vendored locally | Compiles with the fail-closed persistent-state patch |
+| `fido-authenticator` | SoloKeys fork `fae4a1ec8f55d9abe53a7405faf310ef90f3eb71`, vendored locally | Compiles with the fail-closed persistent-state patch |
 | `ctap-types` | `3a5bcecb5286630f38dcc3c65a8f500f7abf2d42` | Compiles unchanged |
 | `trussed` and `trussed-core` | `2ea719b28245f0e68960e99aab16131f7f14d8ff` | Compile unchanged |
 | `ctaphid-dispatch` | 0.4.0 | Compiles unchanged |
