@@ -22,6 +22,8 @@ from cryptography.x509.oid import NameOID, ObjectIdentifier
 import base64
 import json
 
+from sources import production_sources
+
 root = Path(__file__).resolve().parent
 with tempfile.TemporaryDirectory(prefix="salpa-key-helper-test-") as tmp:
     folder = Path(tmp)
@@ -115,12 +117,25 @@ with tempfile.TemporaryDirectory(prefix="salpa-key-helper-test-") as tmp:
             "KEY_HELPER_TEST",
             "-module-cache-path",
             str(folder / "module-cache"),
+            *(str(source) for source in production_sources() if source.name != "main.swift"),
             str(folder / "main.swift"),
             "-o",
             str(folder / "test-helper"),
         ],
         check=True,
     )
+    # Compile the same source list as installation without the test-only entry.
+    production = folder / "production-helper"
+    subprocess.run(
+        ["swiftc", "-suppress-warnings", "-O", "-module-cache-path",
+         str(folder / "module-cache"), *(str(source) for source in production_sources()),
+         "-o", str(production)],
+        check=True,
+    )
+    result = subprocess.run([str(production)], capture_output=True, text=True)
+    assert result.returncode == 1 and "Commands: import ROLE FILE" in result.stderr
+    print("PASS: production entry compiled and rejected empty CLI without Keychain access")
+
     subprocess.run([str(folder / "test-helper"), str(folder)], check=True)
     subprocess.run(
         [str(folder / "test-helper"), str(folder), "restore-attestation-fixture"],

@@ -182,6 +182,181 @@ def record_file(path: Path) -> dict[str, object]:
     return {"file": path.name, "sha256": sha256_file(path), "size": path.stat().st_size}
 
 
+def validate_bootloader_manifest(
+    boot_manifest: dict, source_commit: str, source_tree: str,
+) -> None:
+    """Check the protected boot contract independently of artifact I/O."""
+    protection = boot_manifest.get("protection")
+    verification = boot_manifest.get("custom_boot_verification")
+    if (
+        boot_manifest.get("source_commit") != source_commit
+        or boot_manifest.get("source_tree") != source_tree
+        or boot_manifest.get("build_only") is not True
+        or boot_manifest.get("efuse_operations_performed") is not False
+        or boot_manifest.get("security_profile")
+        != "wemos-s2-mini-protected-prototype"
+        or not isinstance(protection, dict)
+        or protection.get("external_efuse_plan_required") is not True
+        or protection.get("flash_encryption") != "release"
+        or protection.get("secure_boot") != "v2-rsa3072"
+        or not isinstance(verification, dict)
+    ):
+        raise PackageError("bootloader evidence has the wrong protected contract")
+
+
+def validate_application_manifest(
+    manifest: dict, image: str, source_commit: str, source_tree: str,
+    partition_hash: str, plan_hash: str,
+) -> None:
+    """Keep each image role, provenance and feature contract explicit."""
+    contract = APPLICATION_CONTRACTS[image]
+    source = manifest.get("source")
+    build = manifest.get("build")
+    features = build.get("features") if isinstance(build, dict) else None
+    if (
+        manifest.get("image") != contract["image"]
+        or manifest.get("runtime_variant") != contract["runtime_variant"]
+        or manifest.get("image_version") != contract["image_version"]
+        or type(manifest.get("secure_version")) is not int
+        or not 0 <= manifest["secure_version"] <= 16
+        or manifest.get("build_only") is not True
+        or manifest.get("efuse_operations_performed") is not False
+        or not isinstance(source, dict)
+        or source.get("commit") != source_commit
+        or source.get("tree") != source_tree
+        or source.get("partition_table_sha256") != partition_hash
+        or source.get("efuse_plan_sha256") != plan_hash
+        or not isinstance(build, dict)
+        or build.get("partition_profile") != "signed-ab-encrypted"
+        or build.get("security_profile")
+        != "wemos-s2-mini-protected-prototype"
+        or not isinstance(features, list)
+        or set(features) != contract["features"]
+    ):
+        raise PackageError(f"{image} evidence has the wrong protected contract")
+
+
+def validate_trust_roots(
+    verification: dict, application_manifests: dict, digest: str,
+) -> None:
+    """Bind every runtime to the signing root and the same rollback-test epoch."""
+    if verification.get("public_key_digest") != digest:
+        raise PackageError("bootloader trust root does not match the signing key")
+    if application_manifests["runtime"].get("trusted_public_key_digest") != digest:
+        raise PackageError("runtime update trust root does not match the signing key")
+    if (
+        application_manifests["rollback-failure"].get(
+            "trusted_public_key_digest"
+        )
+        != digest
+    ):
+        raise PackageError(
+            "rollback-failure update trust root does not match the signing key"
+        )
+    if application_manifests["storage-provisioner"].get(
+        "trusted_public_key_digest"
+    ) is not None:
+        raise PackageError("storage provisioner must not contain a runtime update key")
+    if application_manifests["rollback-failure"].get(
+        "secure_version"
+    ) != application_manifests["runtime"].get("secure_version"):
+        raise PackageError(
+            "rollback-failure and normal runtime must use the same secure version"
+        )
+
+
+def build_package_manifest(
+    *, files: dict, writes: dict, runtime_usb_name: str, rollback_failure_usb_name: str,
+    rollback_secure_version: int, source_commit: str, source_tree: str,
+    partition_hash: str, plan_hash: str, digest: str, created_at: str,
+) -> dict:
+    """Describe already verified outputs without file, clock or Keychain access."""
+    return {
+        "created_at": created_at,
+        "device_preconditions": {
+            "chip": "esp32s2",
+            "efuse_readback_profile": "pristine",
+            "flash_bytes": 0x400000,
+        },
+        "efuse_operations_performed": False,
+        "files": files,
+        "flash_authorized": False,
+        "flash_encryption": {
+            "algorithm": "AES-128-XTS",
+            "exact_destination_offset_required": True,
+            "key_bytes": FLASH_KEY_BYTES,
+            "key_fingerprint_recorded": False,
+            "key_included": False,
+        },
+        "install_sets": {
+            "initial_storage_provisioner": [
+                "bootloader",
+                "partition_table",
+                "storage-provisioner_ota_0",
+            ],
+            "runtime_with_existing_attestation": ["runtime_ota_0"],
+            "runtime_recovery": ["bootloader", "partition_table", "runtime_ota_0"],
+        },
+        "install_set_preconditions": {
+            "initial_storage_provisioner": [
+                "Verify recoverability of the original attestation key and certificate before erasing fido_store",
+                "Storage initialization alone does not install attestation or make FIDO ready",
+            ],
+            "runtime_with_existing_attestation": [
+                "Original attestation key and certificate already restored in encrypted fido_store",
+                "Boot metadata selects ota_0",
+            ],
+            "runtime_recovery": [
+                "Preserve existing encrypted fido_store with its original attestation identity",
+                "Boot metadata selects ota_0; this install set does not repair a selected ota_1",
+            ],
+        },
+        "kind": "rissokey-protected-package",
+        "layout": {
+            "ota_slot_size": OTA_SIZE,
+            "partition_csv_sha256": partition_hash,
+        },
+        "usb_update": {
+            **files[runtime_usb_name],
+            "plaintext_signed_image": True,
+            "target_selected_by_device": True,
+            "written_encrypted_by_device": True,
+        },
+        "test_fixtures": {
+            "rollback_failure": {
+                **files[rollback_failure_usb_name],
+                "expected_first_boot_confirmation": False,
+                "plaintext_signed_image": True,
+                "secure_version": rollback_secure_version,
+                "target_selected_by_device": True,
+                "written_encrypted_by_device": True,
+            }
+        },
+        "private_signing_key_included": False,
+        "schema": 2,
+        "secure_boot": {
+            "algorithm": "RSA-3072-PSS-SHA256",
+            "public_key_digest": digest,
+            "signed_before_flash_encryption": True,
+        },
+        "security_profile": "wemos-s2-mini-protected-prototype",
+        "source": {
+            "commit": source_commit,
+            "efuse_plan_sha256": plan_hash,
+            "tree": source_tree,
+        },
+        "verification": {
+            "all_ciphertexts_round_trip_at_recorded_offset": True,
+            "all_executable_signatures_verified_before_encryption": True,
+            "fido_store_image_included": False,
+            "otadata_image_included": False,
+            "rollback_failure_signature_verified": True,
+            "usb_update_signature_verified": True,
+        },
+        "writes": writes,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -251,22 +426,8 @@ def main() -> int:
         boot_manifest = load_manifest(
             manifest_paths["bootloader"], "rissokey-protected-bootloader"
         )
-        protection = boot_manifest.get("protection")
-        verification = boot_manifest.get("custom_boot_verification")
-        if (
-            boot_manifest.get("source_commit") != source_commit
-            or boot_manifest.get("source_tree") != source_tree
-            or boot_manifest.get("build_only") is not True
-            or boot_manifest.get("efuse_operations_performed") is not False
-            or boot_manifest.get("security_profile")
-            != "wemos-s2-mini-protected-prototype"
-            or not isinstance(protection, dict)
-            or protection.get("external_efuse_plan_required") is not True
-            or protection.get("flash_encryption") != "release"
-            or protection.get("secure_boot") != "v2-rsa3072"
-            or not isinstance(verification, dict)
-        ):
-            raise PackageError("bootloader evidence has the wrong protected contract")
+        validate_bootloader_manifest(boot_manifest, source_commit, source_tree)
+        verification = boot_manifest["custom_boot_verification"]
         boot_artifacts = boot_manifest.get("artifacts")
         if not isinstance(boot_artifacts, dict):
             raise PackageError("bootloader manifest has no artifact map")
@@ -279,61 +440,17 @@ def main() -> int:
         for image, path in manifest_paths.items():
             if image == "bootloader":
                 continue
-            contract = APPLICATION_CONTRACTS[image]
             manifest = load_manifest(path, "rissokey-protected-application")
-            source = manifest.get("source")
-            build = manifest.get("build")
-            features = build.get("features") if isinstance(build, dict) else None
-            if (
-                manifest.get("image") != contract["image"]
-                or manifest.get("runtime_variant") != contract["runtime_variant"]
-                or manifest.get("image_version") != contract["image_version"]
-                or type(manifest.get("secure_version")) is not int
-                or not 0 <= manifest["secure_version"] <= 16
-                or manifest.get("build_only") is not True
-                or manifest.get("efuse_operations_performed") is not False
-                or not isinstance(source, dict)
-                or source.get("commit") != source_commit
-                or source.get("tree") != source_tree
-                or source.get("partition_table_sha256") != partition_hash
-                or source.get("efuse_plan_sha256") != plan_hash
-                or not isinstance(build, dict)
-                or build.get("partition_profile") != "signed-ab-encrypted"
-                or build.get("security_profile")
-                != "wemos-s2-mini-protected-prototype"
-                or not isinstance(features, list)
-                or set(features) != contract["features"]
-            ):
-                raise PackageError(f"{image} evidence has the wrong protected contract")
+            validate_application_manifest(
+                manifest, image, source_commit, source_tree, partition_hash, plan_hash
+            )
             applications[image] = manifest_artifact(path, manifest.get("artifact"))
             application_manifests[image] = manifest
 
         output_dir.mkdir(parents=True, exist_ok=True)
         output_dir.chmod(0o700)
         digest = public_key_digest(python, signing_public, output_dir / ".key-digest")
-        if verification.get("public_key_digest") != digest:
-            raise PackageError("bootloader trust root does not match the signing key")
-        if application_manifests["runtime"].get("trusted_public_key_digest") != digest:
-            raise PackageError("runtime update trust root does not match the signing key")
-        if (
-            application_manifests["rollback-failure"].get(
-                "trusted_public_key_digest"
-            )
-            != digest
-        ):
-            raise PackageError(
-                "rollback-failure update trust root does not match the signing key"
-            )
-        if application_manifests["storage-provisioner"].get(
-            "trusted_public_key_digest"
-        ) is not None:
-            raise PackageError("storage provisioner must not contain a runtime update key")
-        if application_manifests["rollback-failure"].get(
-            "secure_version"
-        ) != application_manifests["runtime"].get("secure_version"):
-            raise PackageError(
-                "rollback-failure and normal runtime must use the same secure version"
-            )
+        validate_trust_roots(verification, application_manifests, digest)
 
         signed_bootloader = output_dir / ".bootloader-signed.bin"
         sign_image(python, signing_private, bootloader, signed_bootloader)
@@ -470,92 +587,15 @@ def main() -> int:
                 path = encrypted_applications[image][slot]
                 writes[f"{image}_{slot}"] = {**files[path.name], "offset": offset}
 
-        package = {
-            "created_at": datetime.now(UTC).isoformat(),
-            "device_preconditions": {
-                "chip": "esp32s2",
-                "efuse_readback_profile": "pristine",
-                "flash_bytes": 0x400000,
-            },
-            "efuse_operations_performed": False,
-            "files": files,
-            "flash_authorized": False,
-            "flash_encryption": {
-                "algorithm": "AES-128-XTS",
-                "exact_destination_offset_required": True,
-                "key_bytes": FLASH_KEY_BYTES,
-                "key_fingerprint_recorded": False,
-                "key_included": False,
-            },
-            "install_sets": {
-                "initial_storage_provisioner": [
-                    "bootloader",
-                    "partition_table",
-                    "storage-provisioner_ota_0",
-                ],
-                "runtime_with_existing_attestation": ["runtime_ota_0"],
-                "runtime_recovery": ["bootloader", "partition_table", "runtime_ota_0"],
-            },
-            "install_set_preconditions": {
-                "initial_storage_provisioner": [
-                    "Verify recoverability of the original attestation key and certificate before erasing fido_store",
-                    "Storage initialization alone does not install attestation or make FIDO ready",
-                ],
-                "runtime_with_existing_attestation": [
-                    "Original attestation key and certificate already restored in encrypted fido_store",
-                    "Boot metadata selects ota_0",
-                ],
-                "runtime_recovery": [
-                    "Preserve existing encrypted fido_store with its original attestation identity",
-                    "Boot metadata selects ota_0; this install set does not repair a selected ota_1",
-                ],
-            },
-            "kind": "rissokey-protected-package",
-            "layout": {
-                "ota_slot_size": OTA_SIZE,
-                "partition_csv_sha256": partition_hash,
-            },
-            "usb_update": {
-                **files[runtime_usb_image.name],
-                "plaintext_signed_image": True,
-                "target_selected_by_device": True,
-                "written_encrypted_by_device": True,
-            },
-            "test_fixtures": {
-                "rollback_failure": {
-                    **files[rollback_failure_usb_image.name],
-                    "expected_first_boot_confirmation": False,
-                    "plaintext_signed_image": True,
-                    "secure_version": application_manifests["rollback-failure"][
-                        "secure_version"
-                    ],
-                    "target_selected_by_device": True,
-                    "written_encrypted_by_device": True,
-                }
-            },
-            "private_signing_key_included": False,
-            "schema": 2,
-            "secure_boot": {
-                "algorithm": "RSA-3072-PSS-SHA256",
-                "public_key_digest": digest,
-                "signed_before_flash_encryption": True,
-            },
-            "security_profile": "wemos-s2-mini-protected-prototype",
-            "source": {
-                "commit": source_commit,
-                "efuse_plan_sha256": plan_hash,
-                "tree": source_tree,
-            },
-            "verification": {
-                "all_ciphertexts_round_trip_at_recorded_offset": True,
-                "all_executable_signatures_verified_before_encryption": True,
-                "fido_store_image_included": False,
-                "otadata_image_included": False,
-                "rollback_failure_signature_verified": True,
-                "usb_update_signature_verified": True,
-            },
-            "writes": writes,
-        }
+        package = build_package_manifest(
+            files=files, writes=writes,
+            runtime_usb_name=runtime_usb_image.name,
+            rollback_failure_usb_name=rollback_failure_usb_image.name,
+            rollback_secure_version=application_manifests["rollback-failure"]["secure_version"],
+            source_commit=source_commit, source_tree=source_tree,
+            partition_hash=partition_hash, plan_hash=plan_hash, digest=digest,
+            created_at=datetime.now(UTC).isoformat(),
+        )
         package_path = output_dir / "rissokey-protected-package.json"
         package_path.write_text(
             json.dumps(package, indent=2, sort_keys=True) + "\n", encoding="utf-8"

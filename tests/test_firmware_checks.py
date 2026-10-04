@@ -26,6 +26,7 @@ class FirmwareCheckTests(unittest.TestCase):
                          {b["name"] for b in manifest["bin"]})
         runtimes = {(p[0], p[1]) for p in CHECKS.PROFILES.values() if p[2] == "salpa"}
         self.assertEqual(runtimes, {("esp32s2", "legacy-0x8000"),
+                                    ("esp32s2", "signed-ab"),
                                     ("esp32s2", "signed-ab-encrypted"),
                                     ("esp32s3", "legacy-0x8000")})
 
@@ -56,6 +57,14 @@ class FirmwareCheckTests(unittest.TestCase):
                 self.assertEqual("SALPA_EPOCH_PLAN_PATH" in env,
                                  "security-epoch-maintenance" in profile[3])
 
+
+    def test_matrix_checks_signed_update_without_protected_diagnostics(self):
+        profile = CHECKS.PROFILES["s2-signed-ab"]
+        self.assertEqual(profile[:3], ("esp32s2", "signed-ab", "salpa"))
+        self.assertIn("usb-signed-update", profile[3])
+        for feature in ("release-flash-encryption", "security-epoch-preview",
+                        "security-epoch-maintenance"):
+            self.assertNotIn(feature, profile[3])
 
     def test_development_fixture_is_not_an_attestation_certificate(self):
         with tempfile.TemporaryDirectory() as folder:

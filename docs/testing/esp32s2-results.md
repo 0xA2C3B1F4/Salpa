@@ -12,6 +12,10 @@ their original stage-specific conditions, including earlier open ROM access
 and lower security epochs. Acceptance applies to the recorded image and test
 method; later firmware changes need checks appropriate to their scope.
 
+The [2026-09-17 refactoring checks](refactoring-20260917.md) cover the later
+source changes on the host and compiler only. The changed firmware has not
+been installed or accepted on a physical key.
+
 ## Current acceptance status
 
 This table consolidates evidence recorded through 2026-09-10. It does not

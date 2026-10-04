@@ -47,6 +47,14 @@ point to keep the borrowed resources in its frame. Development and protected
 S2 profiles share the FIDO path, with their existing protection and update
 feature gates. Provisioning remains in separate binaries.
 
+`platform::vendor_commands` borrows the updater, presence hardware and USB wait
+hook for vendor dispatch. The startup loop still owns request/response buffers,
+clears them, completes transport replies and confirms successful FIDO requests.
+Diagnostic handlers retain their original evaluation order and feature gates.
+`signed_image::ImageReader` exposes only reads and RSA verification; installed
+slot verification shares the image parser with USB updates without access to
+write or activation methods.
+
 Changes to this split require target builds, Clippy and protected ELF/stack
 checks. Host validation does not extend an earlier image's device acceptance
 to the changed firmware; see the
@@ -122,5 +130,8 @@ bring-up evidence are recorded in `dependency-spike.md`, `usb-bringup.md`, and
 `tools/host_common.py` contains shared hashing, path containment, Git output,
 and SDK-config parsing. Each builder, packager and device command keeps its
 own manifest validation, target identity, region preservation and authorization.
+The protected packager exposes pure bootloader, application and trust-root
+validators plus a manifest constructor. Its CLI retains artifact I/O, signing,
+encryption and their original ordering.
 The public exporter checks selected file contents and local source/document
 references. CI builds and tests the exported tree as a separate check.

@@ -4,8 +4,7 @@
 //! device identifiers, credential data or eFuse programming registers are read.
 
 use crate::{
-    platform::ota::QualifiedLayout,
-    usb_update::{Phase, VerifiedInstalledImage},
+    platform::ota::QualifiedLayout, signed_image::VerifiedInstalledImage, usb_update::Phase,
 };
 
 pub const REQUEST: u8 = 0x12;
@@ -77,7 +76,7 @@ pub fn handle(
     };
     let result = (|| {
         let before = ota::qualified_layout(descriptor_address).map_err(|_| PreviewError::Layout)?;
-        let image = crate::usb_update::verify_installed_slot(
+        let image = crate::signed_image::verify_installed_slot(
             &mut usb_update::Esp32S2UpdateBackend::new(descriptor_address),
             slot,
             &usb_update::trusted_update_key_digest(),

@@ -21,11 +21,12 @@ Shared host helpers keep file hashes, containment comparisons, Git calls and
 SDK-config parsing consistent. Device identity, manifest types, protected
 regions and write approval stay in their specific commands.
 
-The next firmware refactor separates board/mode initialization from the normal
-S2 request loop. A later macOS helper refactor separates Keychain permissions,
-authentication, backup formats, attestation validation and CLI dispatch. Both
-need their own regressions, including physical device tests or actual Keychain
-approval checks. Do not combine them with a trust-root or backup-format change.
+The [2026-09-17 refactoring](testing/refactoring-20260917.md) separates protected
+package validation, installed-image verification, S2 vendor dispatch and the
+macOS helper's responsibilities. Host tests and compile checks passed; physical
+firmware and installed Keychain-helper acceptance remain separate. Future
+changes should preserve the independent manifest checks and avoid combining
+structural edits with trust-root or backup-format changes.
 
 ## Evaluate stronger physical protection
 

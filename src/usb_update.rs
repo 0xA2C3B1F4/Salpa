@@ -11,27 +11,18 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_WRITE_CHUNK: usize = 992;
 pub const ERASE_STEP_SIZE: u32 = 0x1_0000;
 pub const VERIFY_STEP_SIZE: u32 = 0x1_0000;
-pub const OTA_SLOT_SIZE: u32 = 0x1e_0000;
-pub const SIGNATURE_SECTOR_SIZE: u32 = 0x1000;
-pub const SIGNATURE_BLOCK_SIZE: usize = 1216;
-pub const SIGNATURE_CRC_LENGTH: usize = 1196;
-pub const RSA_PUBLIC_KEY_SIZE: usize = 776;
-pub const RSA_SIGNATURE_SIZE: usize = 384;
-pub const MAX_VERSION_LENGTH: usize = 31;
+pub use crate::signed_image::{
+    MAX_VERSION_LENGTH, OTA_SLOT_SIZE, RSA_PUBLIC_KEY_SIZE, RSA_SIGNATURE_SIZE,
+    SIGNATURE_BLOCK_SIZE, SIGNATURE_CRC_LENGTH, SIGNATURE_SECTOR_SIZE,
+};
 /// No successful erase, write or verification progress for two minutes.
 pub const SESSION_IDLE_TIMEOUT_MS: u64 = 120_000;
 /// A single physical approval never authorizes more than fifteen minutes.
 pub const SESSION_MAX_LIFETIME_MS: u64 = 900_000;
 
-const ESP_IMAGE_MAGIC: u8 = 0xe9;
-const ESP32S2_CHIP_ID: u16 = 2;
-const ESP_APP_DESCRIPTOR_MAGIC: u32 = 0xabcd_5432;
-const SECURE_BOOT_V2_SIGNATURE_MAGIC: u8 = 0xe7;
-const SECURE_BOOT_V2_RSA_VERSION: u8 = 2;
-const APP_DESCRIPTOR_OFFSET: u32 = 32;
-const APP_DESCRIPTOR_PREFIX_SIZE: usize = 80;
-const APP_SECURE_VERSION_OFFSET: usize = 4;
-const APP_VERSION_OFFSET: usize = 16;
+use crate::signed_image::{
+    APP_DESCRIPTOR_PREFIX_SIZE, ImageReader, parse_image_metadata, parse_signature_block,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -95,22 +86,13 @@ pub struct UpdateLayout {
     pub activation_entry: u8,
 }
 
-pub trait UpdateBackend {
-    type Error;
-
+pub trait UpdateBackend: ImageReader {
     /// Trusted device time, independent of host traffic. A backwards clock
     /// expires live authority. Tests supply an explicitly controlled clock.
     fn now_ms(&self) -> u64;
     fn layout(&mut self) -> Result<UpdateLayout, Self::Error>;
     fn erase(&mut self, slot: u8, offset: u32, length: u32) -> Result<(), Self::Error>;
     fn write(&mut self, slot: u8, offset: u32, data: &[u8]) -> Result<(), Self::Error>;
-    fn read(&mut self, slot: u8, offset: u32, output: &mut [u8]) -> Result<(), Self::Error>;
-    fn verify_rsa_pss(
-        &mut self,
-        public_key: &[u8; RSA_PUBLIC_KEY_SIZE],
-        signature: &[u8; RSA_SIGNATURE_SIZE],
-        image_digest: &[u8; 32],
-    ) -> Result<bool, Self::Error>;
     fn activate(
         &mut self,
         slot: u8,
@@ -612,105 +594,6 @@ fn parse_session_id(request: &[u8]) -> Option<u32> {
     (request.len() == 4).then(|| u32::from_le_bytes(request.try_into().unwrap()))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InstalledImageError {
-    Slot,
-    Read,
-    Header,
-    Extent,
-    Signature,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VerifiedInstalledImage {
-    pub secure_version: u32,
-    pub signed_image_bytes: u32,
-    pub signed_content_digest: [u8; 32],
-}
-
-/// Verify an installed slot without erasing, writing or selecting it.
-/// The bounded ESP image layout determines the signature location; a caller
-/// cannot supply a shorter length that omits part of the installed image.
-/// This authenticates its contents, but does not prove that they boot. Before
-/// raising an epoch, bind the returned digest to independent boot evidence.
-pub fn verify_installed_slot<B: UpdateBackend>(
-    backend: &mut B,
-    slot: u8,
-    trusted_key_digest: &[u8; 32],
-) -> Result<VerifiedInstalledImage, InstalledImageError> {
-    if slot > 1 {
-        return Err(InstalledImageError::Slot);
-    }
-    let mut prefix = [0; APP_DESCRIPTOR_PREFIX_SIZE];
-    backend
-        .read(slot, 0, &mut prefix)
-        .map_err(|_| InstalledImageError::Read)?;
-    let metadata = parse_image_metadata(&prefix).ok_or(InstalledImageError::Header)?;
-    if prefix[23] != 1 || metadata.secure_version > 16 {
-        return Err(InstalledImageError::Header);
-    }
-    let mut position = 24_u32;
-    for segment in 0..prefix[1] {
-        let mut header = [0; 8];
-        backend
-            .read(slot, position, &mut header)
-            .map_err(|_| InstalledImageError::Read)?;
-        let length = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        if segment == 0 && length < APP_DESCRIPTOR_PREFIX_SIZE as u32 - APP_DESCRIPTOR_OFFSET {
-            return Err(InstalledImageError::Header);
-        }
-        position = position
-            .checked_add(8)
-            .and_then(|value| value.checked_add(length))
-            .filter(|value| *value <= OTA_SLOT_SIZE - SIGNATURE_SECTOR_SIZE - 48)
-            .ok_or(InstalledImageError::Extent)?;
-    }
-    // ESP images put the checksum at the next 16-byte boundary's last byte,
-    // followed by their appended SHA-256. Secure Boot V2 then pads to 4 KiB.
-    let trailer_end = (position | 15)
-        .checked_add(33)
-        .ok_or(InstalledImageError::Extent)?;
-    let signature_offset = trailer_end
-        .checked_add(SIGNATURE_SECTOR_SIZE - 1)
-        .map(|value| value & !(SIGNATURE_SECTOR_SIZE - 1))
-        .filter(|value| {
-            *value >= SIGNATURE_SECTOR_SIZE && *value <= OTA_SLOT_SIZE - SIGNATURE_SECTOR_SIZE
-        })
-        .ok_or(InstalledImageError::Extent)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 1024];
-    let mut offset = 0_u32;
-    while offset < signature_offset {
-        let length = (signature_offset - offset).min(buffer.len() as u32) as usize;
-        backend
-            .read(slot, offset, &mut buffer[..length])
-            .map_err(|_| InstalledImageError::Read)?;
-        hasher.update(&buffer[..length]);
-        offset += length as u32;
-    }
-    let digest: [u8; 32] = hasher.finalize().into();
-    let mut block = [0; SIGNATURE_BLOCK_SIZE];
-    backend
-        .read(slot, signature_offset, &mut block)
-        .map_err(|_| InstalledImageError::Read)?;
-    let signature =
-        parse_signature_block(&block, trusted_key_digest).ok_or(InstalledImageError::Signature)?;
-    if *signature.image_digest != digest {
-        return Err(InstalledImageError::Signature);
-    }
-    if !backend
-        .verify_rsa_pss(signature.public_key, signature.signature, &digest)
-        .map_err(|_| InstalledImageError::Signature)?
-    {
-        return Err(InstalledImageError::Signature);
-    }
-    Ok(VerifiedInstalledImage {
-        secure_version: metadata.secure_version,
-        signed_image_bytes: signature_offset + SIGNATURE_SECTOR_SIZE,
-        signed_content_digest: digest,
-    })
-}
-
 fn next_sequence(current: u32, target_slot: u8) -> Option<u32> {
     if current == 0 || target_slot > 1 {
         return None;
@@ -720,87 +603,13 @@ fn next_sequence(current: u32, target_slot: u8) -> Option<u32> {
     current.checked_add(increment)
 }
 
-struct ImageMetadata<'a> {
-    secure_version: u32,
-    version: &'a [u8],
-}
-
-fn parse_image_metadata(
-    image_prefix: &[u8; APP_DESCRIPTOR_PREFIX_SIZE],
-) -> Option<ImageMetadata<'_>> {
-    if image_prefix[0] != ESP_IMAGE_MAGIC
-        || !(1..=16).contains(&image_prefix[1])
-        || u16::from_le_bytes(image_prefix[12..14].try_into().ok()?) != ESP32S2_CHIP_ID
-        || u32::from_le_bytes(
-            image_prefix[APP_DESCRIPTOR_OFFSET as usize..APP_DESCRIPTOR_OFFSET as usize + 4]
-                .try_into()
-                .ok()?,
-        ) != ESP_APP_DESCRIPTOR_MAGIC
-    {
-        return None;
-    }
-    let descriptor = &image_prefix[APP_DESCRIPTOR_OFFSET as usize..];
-    let secure_version = u32::from_le_bytes(
-        descriptor[APP_SECURE_VERSION_OFFSET..APP_SECURE_VERSION_OFFSET + 4]
-            .try_into()
-            .ok()?,
-    );
-    let version_field = &descriptor[APP_VERSION_OFFSET..APP_VERSION_OFFSET + 32];
-    let version_length = version_field.iter().position(|byte| *byte == 0)?;
-    if version_length == 0 || version_length > MAX_VERSION_LENGTH {
-        return None;
-    }
-    Some(ImageMetadata {
-        secure_version,
-        version: &version_field[..version_length],
-    })
-}
-
-struct ParsedSignature<'a> {
-    image_digest: &'a [u8; 32],
-    public_key: &'a [u8; RSA_PUBLIC_KEY_SIZE],
-    signature: &'a [u8; RSA_SIGNATURE_SIZE],
-}
-
-fn parse_signature_block<'a>(
-    block: &'a [u8; SIGNATURE_BLOCK_SIZE],
-    trusted_key_digest: &[u8; 32],
-) -> Option<ParsedSignature<'a>> {
-    if block[0] != SECURE_BOOT_V2_SIGNATURE_MAGIC
-        || block[1] != SECURE_BOOT_V2_RSA_VERSION
-        || u32::from_le_bytes(block[1196..1200].try_into().ok()?)
-            != esp_crc32_le(0, &block[..SIGNATURE_CRC_LENGTH])
-    {
-        return None;
-    }
-    let image_digest = block[4..36].try_into().ok()?;
-    let public_key = block[36..812].try_into().ok()?;
-    let key_digest: [u8; 32] = Sha256::digest(public_key).into();
-    if key_digest != *trusted_key_digest {
-        return None;
-    }
-    let signature = block[812..1196].try_into().ok()?;
-    Some(ParsedSignature {
-        image_digest,
-        public_key,
-        signature,
-    })
-}
-
-fn esp_crc32_le(seed: u32, data: &[u8]) -> u32 {
-    let mut crc = !seed;
-    for byte in data {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signed_image::{
+        esp_crc32_le,
+        test_support::{signed_image, sized_signed_image},
+    };
     extern crate std;
     use self::std::{vec, vec::Vec};
 
@@ -848,8 +657,6 @@ mod tests {
     }
 
     impl UpdateBackend for FakeBackend {
-        type Error = ();
-
         fn now_ms(&self) -> u64 {
             self.now_ms
         }
@@ -878,27 +685,6 @@ mod tests {
             Ok(())
         }
 
-        fn read(&mut self, slot: u8, offset: u32, output: &mut [u8]) -> Result<(), Self::Error> {
-            self.now_ms = self.now_ms.saturating_add(self.operation_elapsed_ms);
-            if self.read_error {
-                return Err(());
-            }
-            output.copy_from_slice(
-                &self.slots[slot as usize][offset as usize..offset as usize + output.len()],
-            );
-            Ok(())
-        }
-
-        fn verify_rsa_pss(
-            &mut self,
-            _public_key: &[u8; RSA_PUBLIC_KEY_SIZE],
-            _signature: &[u8; RSA_SIGNATURE_SIZE],
-            _image_digest: &[u8; 32],
-        ) -> Result<bool, Self::Error> {
-            self.now_ms = self.now_ms.saturating_add(self.rsa_elapsed_ms);
-            Ok(self.rsa_valid)
-        }
-
         fn activate(
             &mut self,
             slot: u8,
@@ -916,43 +702,6 @@ mod tests {
         }
     }
 
-    fn signed_image(secure_version: u32, version: &[u8]) -> (Vec<u8>, [u8; 32]) {
-        sized_signed_image(
-            secure_version,
-            version,
-            (SIGNATURE_SECTOR_SIZE * 2) as usize,
-        )
-    }
-
-    fn sized_signed_image(secure_version: u32, version: &[u8], size: usize) -> (Vec<u8>, [u8; 32]) {
-        assert!(size >= (SIGNATURE_SECTOR_SIZE * 2) as usize);
-        assert!(size.is_multiple_of(SIGNATURE_SECTOR_SIZE as usize));
-        let mut image = vec![0xff; size];
-        image[0] = ESP_IMAGE_MAGIC;
-        image[1] = 1;
-        image[12..14].copy_from_slice(&ESP32S2_CHIP_ID.to_le_bytes());
-        image[23] = 1;
-        image[32..36].copy_from_slice(&ESP_APP_DESCRIPTOR_MAGIC.to_le_bytes());
-        image[36..40].copy_from_slice(&secure_version.to_le_bytes());
-        image[48..48 + version.len()].copy_from_slice(version);
-        image[48 + version.len()] = 0;
-
-        let signed_length = size - SIGNATURE_SECTOR_SIZE as usize;
-        let signed_digest: [u8; 32] = Sha256::digest(&image[..signed_length]).into();
-        let block = &mut image[signed_length..signed_length + SIGNATURE_BLOCK_SIZE];
-        block[0] = SECURE_BOOT_V2_SIGNATURE_MAGIC;
-        block[1] = SECURE_BOOT_V2_RSA_VERSION;
-        block[4..36].copy_from_slice(&signed_digest);
-        for (index, byte) in block[36..812].iter_mut().enumerate() {
-            *byte = index as u8;
-        }
-        block[812..1196].fill(0x5a);
-        let crc = esp_crc32_le(0, &block[..SIGNATURE_CRC_LENGTH]);
-        block[1196..1200].copy_from_slice(&crc.to_le_bytes());
-        let trusted_digest = Sha256::digest(&block[36..812]).into();
-        (image, trusted_digest)
-    }
-
     fn begin_request(image: &[u8], secure_version: u32, version: &[u8]) -> Vec<u8> {
         let mut request = vec![Operation::Begin as u8, PROTOCOL_VERSION];
         request.extend_from_slice(&(image.len() as u32).to_le_bytes());
@@ -961,126 +710,6 @@ mod tests {
         request.push(version.len() as u8);
         request.extend_from_slice(version);
         request
-    }
-
-    fn installed_fixture() -> (FakeBackend, [u8; 32]) {
-        let (mut image, trusted) = signed_image(4, b"normal");
-        image[24..28].copy_from_slice(&0x3f00_0020_u32.to_le_bytes());
-        image[28..32].copy_from_slice(&256_u32.to_le_bytes());
-        let digest = Sha256::digest(&image[..4096]);
-        image[4100..4132].copy_from_slice(&digest);
-        let crc = esp_crc32_le(0, &image[4096..4096 + SIGNATURE_CRC_LENGTH]);
-        image[4096 + 1196..4096 + 1200].copy_from_slice(&crc.to_le_bytes());
-        let mut backend = FakeBackend::new();
-        for slot in &mut backend.slots {
-            slot[..image.len()].copy_from_slice(&image);
-        }
-        (backend, trusted)
-    }
-
-    #[test]
-    fn installed_slot_verification_reads_both_slots_without_mutations() {
-        let (mut backend, trusted) = installed_fixture();
-        for slot in 0..2 {
-            let image = verify_installed_slot(&mut backend, slot, &trusted).unwrap();
-            assert_eq!(image.secure_version, 4);
-            assert_eq!(image.signed_image_bytes, 8192);
-            assert_eq!(
-                image.signed_content_digest,
-                Sha256::digest(&backend.slots[slot as usize][..4096]).as_slice()
-            );
-        }
-        assert!(backend.mutations.is_empty());
-    }
-
-    #[test]
-    fn installed_verifier_handles_qualified_multisegment_image_extents() {
-        // Segment lengths from the three epoch-4 test builds. Only layout is
-        // retained here: all segment contents and signature bytes are synthetic.
-        for (lengths, expected_bytes) in [
-            ([7436_u32, 1472, 5120, 51476, 344500], 417792_u32),
-            ([7452, 1472, 5120, 51460, 345696], 417792),
-            ([7444, 1472, 5120, 51468, 343628], 413696),
-        ] {
-            let (mut backend, trusted) = installed_fixture();
-            let signature = backend.slots[0][4096..4096 + SIGNATURE_BLOCK_SIZE].to_vec();
-            backend.slots[0][80..].fill(0);
-            backend.slots[0][1] = lengths.len() as u8;
-            let mut position = 24_usize;
-            for length in lengths {
-                backend.slots[0][position + 4..position + 8].copy_from_slice(&length.to_le_bytes());
-                position += 8 + length as usize;
-            }
-            let offset = expected_bytes as usize - SIGNATURE_SECTOR_SIZE as usize;
-            let digest = Sha256::digest(&backend.slots[0][..offset]);
-            let block = &mut backend.slots[0][offset..offset + SIGNATURE_BLOCK_SIZE];
-            block.copy_from_slice(&signature);
-            block[4..36].copy_from_slice(&digest);
-            let crc = esp_crc32_le(0, &block[..SIGNATURE_CRC_LENGTH]);
-            block[1196..1200].copy_from_slice(&crc.to_le_bytes());
-            let verified = verify_installed_slot(&mut backend, 0, &trusted).unwrap();
-            assert_eq!(verified.signed_image_bytes, expected_bytes);
-            assert_eq!(verified.signed_content_digest, digest.as_slice());
-            assert!(backend.mutations.is_empty());
-        }
-    }
-
-    #[test]
-    fn installed_slot_verification_rejects_unbounded_segment_layouts() {
-        for length in [u32::MAX, OTA_SLOT_SIZE, OTA_SLOT_SIZE - 4096, 0] {
-            let (mut backend, trusted) = installed_fixture();
-            backend.slots[0][28..32].copy_from_slice(&length.to_le_bytes());
-            assert!(matches!(
-                verify_installed_slot(&mut backend, 0, &trusted),
-                Err(InstalledImageError::Extent | InstalledImageError::Header)
-            ));
-            assert!(backend.mutations.is_empty());
-        }
-    }
-
-    #[test]
-    fn installed_slot_verification_rejects_wrong_root_digest_and_rsa_failure() {
-        let (mut backend, mut trusted) = installed_fixture();
-        trusted[0] ^= 1;
-        assert_eq!(
-            verify_installed_slot(&mut backend, 0, &trusted),
-            Err(InstalledImageError::Signature)
-        );
-        let (mut backend, trusted) = installed_fixture();
-        backend.slots[0][256] ^= 1;
-        assert_eq!(
-            verify_installed_slot(&mut backend, 0, &trusted),
-            Err(InstalledImageError::Signature)
-        );
-        let (mut backend, trusted) = installed_fixture();
-        backend.rsa_valid = false;
-        assert_eq!(
-            verify_installed_slot(&mut backend, 0, &trusted),
-            Err(InstalledImageError::Signature)
-        );
-        assert!(backend.mutations.is_empty());
-    }
-
-    #[test]
-    fn installed_slot_verification_rejects_reads_bad_headers_and_invalid_slot() {
-        let (mut backend, trusted) = installed_fixture();
-        backend.read_error = true;
-        assert_eq!(
-            verify_installed_slot(&mut backend, 0, &trusted),
-            Err(InstalledImageError::Read)
-        );
-        assert_eq!(
-            verify_installed_slot(&mut backend, 2, &trusted),
-            Err(InstalledImageError::Slot)
-        );
-        for (offset, value) in [(0, 0), (1, 0), (1, 17), (23, 0), (36, 17)] {
-            let (mut backend, trusted) = installed_fixture();
-            backend.slots[0][offset] = value;
-            assert_eq!(
-                verify_installed_slot(&mut backend, 0, &trusted),
-                Err(InstalledImageError::Header)
-            );
-        }
     }
 
     fn response(updater: &mut UsbUpdater<FakeBackend>, request: &[u8], present: bool) -> Vec<u8> {
@@ -2093,5 +1722,29 @@ mod tests {
             StatusCode::Ok as u8
         );
         assert_eq!(updater.session.as_ref().unwrap().completed, 64);
+    }
+    impl ImageReader for FakeBackend {
+        type Error = ();
+
+        fn read(&mut self, slot: u8, offset: u32, output: &mut [u8]) -> Result<(), Self::Error> {
+            self.now_ms = self.now_ms.saturating_add(self.operation_elapsed_ms);
+            if self.read_error {
+                return Err(());
+            }
+            output.copy_from_slice(
+                &self.slots[slot as usize][offset as usize..offset as usize + output.len()],
+            );
+            Ok(())
+        }
+
+        fn verify_rsa_pss(
+            &mut self,
+            _public_key: &[u8; RSA_PUBLIC_KEY_SIZE],
+            _signature: &[u8; RSA_SIGNATURE_SIZE],
+            _image_digest: &[u8; 32],
+        ) -> Result<bool, Self::Error> {
+            self.now_ms = self.now_ms.saturating_add(self.rsa_elapsed_ms);
+            Ok(self.rsa_valid)
+        }
     }
 }

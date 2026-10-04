@@ -14,7 +14,7 @@ use super::{
     security_epoch::{self, ApprovedPlan, ObservedState, PreparedChange, SlotEvidence},
     security_epoch_plan, usb_update,
 };
-use crate::usb_update::{Phase, verify_installed_slot};
+use crate::{signed_image::verify_installed_slot, usb_update::Phase};
 
 const INSPECT: u8 = 0x13;
 const PROGRAM: u8 = 0x14;

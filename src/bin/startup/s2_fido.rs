@@ -217,59 +217,15 @@ pub(crate) fn run(peripherals: Peripherals) -> ! {
                             .copy_request(&mut request)
                             .expect("update event without request payload");
                         let mut response = [0_u8; 64];
-                        #[cfg(feature = "security-epoch-maintenance")]
-                        let maintenance_len = salpa::platform::security_epoch_maintenance::handle(
+                        let response_len = salpa::platform::vendor_commands::handle(
                             &request[..request_len],
+                            &mut usb_updater,
                             core::ptr::addr_of!(ESP_APP_DESC) as u32,
-                            usb_updater.phase(),
+                            ESP_APP_DESC.secure_version(),
                             &user_hardware,
                             &usb_runtime,
                             &mut response,
                         );
-                        #[cfg(not(feature = "security-epoch-maintenance"))]
-                        let maintenance_len: Option<usize> = None;
-                        #[cfg(any(
-                            feature = "security-epoch-preview",
-                            feature = "security-epoch-maintenance"
-                        ))]
-                        let preview_len = salpa::platform::security_epoch_preview::handle(
-                            &request[..request_len],
-                            core::ptr::addr_of!(ESP_APP_DESC) as u32,
-                            usb_updater.phase(),
-                            &mut response,
-                        );
-                        #[cfg(not(any(
-                            feature = "security-epoch-preview",
-                            feature = "security-epoch-maintenance"
-                        )))]
-                        let preview_len: Option<usize> = None;
-                        #[cfg(feature = "release-flash-encryption")]
-                        let memory_len = (request[..request_len]
-                            == [salpa::platform::memory_protection::REQUEST])
-                        .then(|| salpa::platform::memory_protection::status(&mut response));
-                        #[cfg(not(feature = "release-flash-encryption"))]
-                        let memory_len: Option<usize> = None;
-                        let mut response_len = if let Some(length) =
-                            maintenance_len.or(preview_len).or(memory_len)
-                        {
-                            length
-                        } else if request[..request_len]
-                            == [salpa::platform::security_status::REQUEST]
-                        {
-                            salpa::platform::security_status::read(ESP_APP_DESC.secure_version())
-                                .encode(&mut response)
-                        } else {
-                            usb_updater.handle(&request[..request_len], false, &mut response)
-                        };
-                        if response[0] == salpa::usb_update::StatusCode::UserPresenceRequired as u8
-                            && salpa::platform::s2_user_presence::confirm_update_user_presence(
-                                &user_hardware,
-                                &usb_runtime,
-                            )
-                        {
-                            response_len =
-                                usb_updater.handle(&request[..request_len], true, &mut response);
-                        }
                         request[..request_len].zeroize();
                         let completion = request_completion::complete_update(
                             &mut response[..response_len],

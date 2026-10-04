@@ -1,0 +1,105 @@
+{
+  "created_at": "2026-09-17T00:00:00+00:00",
+  "device_preconditions": {
+    "chip": "esp32s2",
+    "efuse_readback_profile": "pristine",
+    "flash_bytes": 4194304
+  },
+  "efuse_operations_performed": false,
+  "files": {
+    "rollback-failure-usb-signed.bin": {
+      "file": "rollback-failure-usb-signed.bin",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 8192
+    },
+    "runtime-usb-signed.bin": {
+      "file": "runtime-usb-signed.bin",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 8192
+    }
+  },
+  "flash_authorized": false,
+  "flash_encryption": {
+    "algorithm": "AES-128-XTS",
+    "exact_destination_offset_required": true,
+    "key_bytes": 32,
+    "key_fingerprint_recorded": false,
+    "key_included": false
+  },
+  "install_set_preconditions": {
+    "initial_storage_provisioner": [
+      "Verify recoverability of the original attestation key and certificate before erasing fido_store",
+      "Storage initialization alone does not install attestation or make FIDO ready"
+    ],
+    "runtime_recovery": [
+      "Preserve existing encrypted fido_store with its original attestation identity",
+      "Boot metadata selects ota_0; this install set does not repair a selected ota_1"
+    ],
+    "runtime_with_existing_attestation": [
+      "Original attestation key and certificate already restored in encrypted fido_store",
+      "Boot metadata selects ota_0"
+    ]
+  },
+  "install_sets": {
+    "initial_storage_provisioner": [
+      "bootloader",
+      "partition_table",
+      "storage-provisioner_ota_0"
+    ],
+    "runtime_recovery": [
+      "bootloader",
+      "partition_table",
+      "runtime_ota_0"
+    ],
+    "runtime_with_existing_attestation": [
+      "runtime_ota_0"
+    ]
+  },
+  "kind": "rissokey-protected-package",
+  "layout": {
+    "ota_slot_size": 1966080,
+    "partition_csv_sha256": "partition-fixture"
+  },
+  "private_signing_key_included": false,
+  "schema": 2,
+  "secure_boot": {
+    "algorithm": "RSA-3072-PSS-SHA256",
+    "public_key_digest": "root-fixture",
+    "signed_before_flash_encryption": true
+  },
+  "security_profile": "wemos-s2-mini-protected-prototype",
+  "source": {
+    "commit": "commit-fixture",
+    "efuse_plan_sha256": "plan-fixture",
+    "tree": "tree-fixture"
+  },
+  "test_fixtures": {
+    "rollback_failure": {
+      "expected_first_boot_confirmation": false,
+      "file": "rollback-failure-usb-signed.bin",
+      "plaintext_signed_image": true,
+      "secure_version": 5,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 8192,
+      "target_selected_by_device": true,
+      "written_encrypted_by_device": true
+    }
+  },
+  "usb_update": {
+    "file": "runtime-usb-signed.bin",
+    "plaintext_signed_image": true,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "size": 8192,
+    "target_selected_by_device": true,
+    "written_encrypted_by_device": true
+  },
+  "verification": {
+    "all_ciphertexts_round_trip_at_recorded_offset": true,
+    "all_executable_signatures_verified_before_encryption": true,
+    "fido_store_image_included": false,
+    "otadata_image_included": false,
+    "rollback_failure_signature_verified": true,
+    "usb_update_signature_verified": true
+  },
+  "writes": {}
+}

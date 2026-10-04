@@ -73,3 +73,6 @@ pub mod security_epoch_maintenance;
 ))]
 pub mod usb_runtime;
 pub mod user_presence;
+
+#[cfg(any(feature = "usb-signed-update", test))]
+pub mod vendor_commands;

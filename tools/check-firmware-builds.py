@@ -25,6 +25,12 @@ PROFILES = {
         "salpa",
         ["ctaphid-bringup", "fido-stack", "mcu-esp32s2"],
     ),
+    "s2-signed-ab": (
+        "esp32s2",
+        "signed-ab",
+        "salpa",
+        ["ctaphid-bringup", "fido-stack", "mcu-esp32s2", "usb-signed-update"],
+    ),
     "s2-protected": (
         "esp32s2",
         "signed-ab-encrypted",

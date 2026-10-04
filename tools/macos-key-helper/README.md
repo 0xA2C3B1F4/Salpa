@@ -88,3 +88,23 @@ Ciphertext creation does not establish any of those results. Firmware may embed
 the expected certificate hash and uncompressed 65-byte public key; it must never
 embed the private scalar. Keep encrypted backups and original material until
 their retention is explicitly reconsidered.
+
+## Source organization
+
+The helper still builds as one executable with the same command line and
+Keychain service identity. `sources.py` lists the production files used by both
+`install.py` and `test-crypto.py`:
+
+- `Keychain.swift` owns item access, ACL policy and key import.
+- `UserApproval.swift` owns interactive authentication and password prompts.
+- `Crypto.swift` owns the existing RSA, AES-XTS and password-derivation helpers.
+- `Attestation.swift` validates and encodes the FIDO identity.
+- `Backup.swift` and `AttestationRecovery.swift` own their existing backup formats
+  and recovery checks.
+- `Support.swift` and `Inventory.swift` contain shared file and inventory access.
+- `main.swift` dispatches CLI commands and handles process errors.
+
+The fixture runner compiles both the test entry and the production entry. Its
+synthetic crypto and recovery checks do not establish actual Keychain prompt,
+ACL or installed-helper acceptance. Those require the separate interactive
+integration procedure after installing the changed signed helper.

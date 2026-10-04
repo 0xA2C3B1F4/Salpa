@@ -9,6 +9,8 @@ import stat
 import subprocess
 import tempfile
 
+from sources import production_sources
+
 parser = argparse.ArgumentParser()
 parser.add_argument(
     '--identity',
@@ -17,7 +19,6 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-source = Path(__file__).resolve().parent / 'main.swift'
 destination = Path.home() / 'Library/Application Support/RissoKey'
 destination.mkdir(mode=0o700, parents=True, exist_ok=True)
 mode = destination.lstat()
@@ -38,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix='salpa-key-helper-build-') as temp:
             '-suppress-warnings',
             '-module-cache-path',
             str(folder / 'module-cache'),
-            str(source),
+            *(str(source) for source in production_sources()),
             '-o',
             str(binary),
         ],

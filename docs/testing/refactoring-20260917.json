@@ -1,0 +1,546 @@
+{
+  "schema": 1,
+  "kind": "salpa-refactoring-host-validation",
+  "date": "2026-09-17",
+  "development_source_commit": "a4d7e27019c1e00ec144d0c6ce6e7b58dbc61341",
+  "baseline_commit": "f23bf0a38e7cf6f37ca8d608c2804527de448064",
+  "implementation_commits": [
+    "15668a6c76be64c349af2a3cfa44be1ba98f9799",
+    "561f2fcad44c73ec47dc09adb2d43201ac239a3f",
+    "05273bf89adc5e08063d0d40721fafdd0339c852",
+    "a4d7e27019c1e00ec144d0c6ce6e7b58dbc61341"
+  ],
+  "source_sha256": {
+    "src/bin/startup/s2_fido.rs": "f2397ee86f8864e19033c768f426419a72b86aef72c892b76bd166c1af51329d",
+    "src/lib.rs": "a6b211f216d5a59abcce9dbf8aabfe19907d1669784c5dc085a135c8ef677e83",
+    "src/platform.rs": "48382decf6a68d58b134ede7c1733a7e5ffc3db047c7c254830b8f58aa3d85e0",
+    "src/platform/security_epoch_maintenance.rs": "91f024775d1fa58dc6219b47eb6d3f90a568223533dcf05025c1e43ff251698d",
+    "src/platform/security_epoch_preview.rs": "5f016494f8ae03eac60d4331820ea89a4805615900bee97eb3bf379a019e016a",
+    "src/platform/usb_update.rs": "39ea9a457f28b254da623d9c3e0417a322c09a0763c631c3313ebca454a3e2f2",
+    "src/platform/vendor_commands.rs": "33c6053bfc934df73fb87b201df2b5e0cd293c7061c4e5e30a8735d4df99f4aa",
+    "src/signed_image.rs": "63b5738ebd147304346224916e624dedd2a94b037a812cc028f2fd2e2caf9c90",
+    "src/usb_update.rs": "f94e08d288744035ff22e8a792ebac18b7b34564cda7a6f0b7bb0694926046b0",
+    "tests/fixtures/protected-package-manifest.json": "aec4ab97fdd306e9a92b5a8032bd35b23f816d386dd9cf17734da14d3892f274",
+    "tests/test_firmware_checks.py": "8e36edd389b486f24fd1fa6e5f872acebf999f898dde615517b88c34da31f5b0",
+    "tests/test_protected_package.py": "bfcf302138db25be959ce770032f5e2a5a893831d8590cab4fcff4f0080c50f4",
+    "tools/check-firmware-builds.py": "fdad226c255f7fc9e4bb5ec4f6cc7cfed70830b8536182a5527b8a68193107ee",
+    "tools/macos-key-helper/Attestation.swift": "09e06ad8262f2f8efae2b1c24b8b39bcb6d5c432ecc1cae0440fbbb3bbdd32b3",
+    "tools/macos-key-helper/AttestationRecovery.swift": "b120c0ae4264cd07098a901250174d18b0fb224e96cc2cdf86cb53b08d543dea",
+    "tools/macos-key-helper/Backup.swift": "0a16c28ea0f615c25f365104bc5bac37f914938e18f73adce530d626639bbc6d",
+    "tools/macos-key-helper/Crypto.swift": "3c7dd664a74735f3125c8ba2af1344d28a081ec1482c5f0c4ce20e401feb5f91",
+    "tools/macos-key-helper/Inventory.swift": "a4e6e096652a78ad8a46dca6b595d43c295e033ddb2309e810081386cb4c2d4a",
+    "tools/macos-key-helper/Keychain.swift": "5899a1ced0abcf277711072897ef50bda3b210d14457d8e68dc794c951b41693",
+    "tools/macos-key-helper/README.md": "e3ab2acde5d9816f442e79b38f973203ba8f1eabdb0101618da90e8e1b2cf33f",
+    "tools/macos-key-helper/Support.swift": "2b5a574b5fbf7bb2195f97d629cf0f08349d539eb5741846f80467bb457c74a4",
+    "tools/macos-key-helper/UserApproval.swift": "e31dc85c626de31dd19c603cc5cde8f01de7f418368d95f49a24c8403d0eff5d",
+    "tools/macos-key-helper/install.py": "82c46d78d1be0d9f4b603ef1f7e5f4d77d2e52c359fa81688a83ae74617ee8d9",
+    "tools/macos-key-helper/main.swift": "492497b7634460d7626b210864fb30a7bca7adb0155effbc9178122d51b23999",
+    "tools/macos-key-helper/sources.py": "55f3d1f02f0b92e68c2a4b1777085e78e558f2c0b007c894d019407674e561d1",
+    "tools/macos-key-helper/test-crypto.py": "54098c505774df88b2e40b4a48c21939cbcabd20929cfbba9c7aa490c033bfc0",
+    "tools/prepare-protected-package.py": "851aa185d95a3d6be48503a404e46a83de247c89b15c7cbc417dc7fa334277dd"
+  },
+  "tests": {
+    "rust_host": 148,
+    "persistent_state": 31,
+    "storage_faults": 11,
+    "python": 106,
+    "swift_declarations_preserved": 66,
+    "swift_crypto_recovery_fixtures": "passed",
+    "swift_production_compile_and_empty_cli": "passed"
+  },
+  "target_checks": [
+    {
+      "profile": "s2-development",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2",
+        "--bin",
+        "salpa"
+      ],
+      "passed": true,
+      "elf_bytes": 568868,
+      "elf_sha256": "dd85f63ef00ba0649410d9f894eee21742126b79c494ec7fbad1731bab9df537"
+    },
+    {
+      "profile": "s2-development",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2",
+        "--bin",
+        "salpa",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    },
+    {
+      "profile": "s2-protected",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption,signed-ab-update,usb-signed-update",
+        "--bin",
+        "salpa"
+      ],
+      "passed": true,
+      "elf_bytes": 580192,
+      "elf_sha256": "bb02c3bd3aabc477ea860b9f5990c88f51bc256d2a8bbaa75fa2374cc2e25455",
+      "memory_protection": {
+        "schema": 1,
+        "iram_end": 1073905664,
+        "data_start": 1073446912,
+        "stack_reserved_bytes": 149332,
+        "handler_address": 1073893984,
+        "expected_permissions": [
+          1755,
+          434176,
+          0,
+          450887765,
+          30720,
+          0,
+          110592,
+          0
+        ],
+        "device_accessed": false,
+        "handler_has_no_calls_or_returns": true,
+        "elf_sha256": "bb02c3bd3aabc477ea860b9f5990c88f51bc256d2a8bbaa75fa2374cc2e25455"
+      }
+    },
+    {
+      "profile": "s2-protected",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption,signed-ab-update,usb-signed-update",
+        "--bin",
+        "salpa",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    },
+    {
+      "profile": "s3-bringup",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s3",
+        "--bin",
+        "salpa"
+      ],
+      "passed": true,
+      "elf_bytes": 269904,
+      "elf_sha256": "11a01ddf417dbdf19717ac0265c751ff4217d328a2f6dd51967318afbab9ab29"
+    },
+    {
+      "profile": "s3-bringup",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s3",
+        "--bin",
+        "salpa",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    },
+    {
+      "profile": "s2-epoch-preview",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2,security-epoch-preview",
+        "--bin",
+        "salpa"
+      ],
+      "passed": true,
+      "elf_bytes": 583008,
+      "elf_sha256": "05154fd975b5e6b2f5b53ad378695013f86ff5480668a4ae8aa701eb2b1f3c0d",
+      "memory_protection": {
+        "schema": 1,
+        "iram_end": 1073905664,
+        "data_start": 1073446912,
+        "stack_reserved_bytes": 149332,
+        "handler_address": 1073893984,
+        "expected_permissions": [
+          1755,
+          434176,
+          0,
+          450887765,
+          30720,
+          0,
+          110592,
+          0
+        ],
+        "device_accessed": false,
+        "handler_has_no_calls_or_returns": true,
+        "elf_sha256": "05154fd975b5e6b2f5b53ad378695013f86ff5480668a4ae8aa701eb2b1f3c0d"
+      }
+    },
+    {
+      "profile": "s2-epoch-preview",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2,security-epoch-preview",
+        "--bin",
+        "salpa",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    },
+    {
+      "profile": "s2-attestation-import",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "attestation-import,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption",
+        "--bin",
+        "import-attestation"
+      ],
+      "passed": true,
+      "elf_bytes": 376824,
+      "elf_sha256": "6385f01cc7a8b1f75447b3ba2f4fa2abf9740598197d207684b91b4e7d294ca2"
+    },
+    {
+      "profile": "s2-attestation-import",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "attestation-import,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption",
+        "--bin",
+        "import-attestation",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    },
+    {
+      "profile": "s2-storage-provision",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "storage-provisioning,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption",
+        "--bin",
+        "provision-storage"
+      ],
+      "passed": true,
+      "elf_bytes": 103612,
+      "elf_sha256": "3202b2abbcbad05e191a4a71eff1da16543bd466f5c91f7c78f4058f74d135fa"
+    },
+    {
+      "profile": "s2-storage-provision",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "storage-provisioning,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption",
+        "--bin",
+        "provision-storage",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    },
+    {
+      "profile": "s2-development-provision",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "development-provisioning,mcu-esp32s2",
+        "--bin",
+        "provision-development"
+      ],
+      "passed": true,
+      "elf_bytes": 375608,
+      "elf_sha256": "0c50185ba5429dd8fdb0b2288824dfe5c9b8f43daf56150709b553230ebe3adc"
+    },
+    {
+      "profile": "s2-development-provision",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "development-provisioning,mcu-esp32s2",
+        "--bin",
+        "provision-development",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    },
+    {
+      "profile": "s2-storage-powercut",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "physical-storage-fault-test,mcu-esp32s2",
+        "--bin",
+        "storage-powercut-test"
+      ],
+      "passed": true,
+      "elf_bytes": 109384,
+      "elf_sha256": "84f0f9aabddaeef6a0af55f2bc824a3ca0f8f8a88ba250944239e727e573232d"
+    },
+    {
+      "profile": "s2-storage-powercut",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "physical-storage-fault-test,mcu-esp32s2",
+        "--bin",
+        "storage-powercut-test",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    },
+    {
+      "profile": "s2-epoch-maintenance",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption,signed-ab-update,usb-signed-update,security-epoch-maintenance",
+        "--bin",
+        "salpa"
+      ],
+      "passed": true,
+      "elf_bytes": 589500,
+      "elf_sha256": "ee24ccbaa98329d14cfbb62553aa91a92ac71b7b5fb7cd93fc7aa7c9cc1e6751",
+      "memory_protection": {
+        "schema": 1,
+        "iram_end": 1073905664,
+        "data_start": 1073446912,
+        "stack_reserved_bytes": 149292,
+        "handler_address": 1073894056,
+        "expected_permissions": [
+          1755,
+          434176,
+          0,
+          450887765,
+          30720,
+          0,
+          110592,
+          0
+        ],
+        "device_accessed": false,
+        "handler_has_no_calls_or_returns": true,
+        "elf_sha256": "ee24ccbaa98329d14cfbb62553aa91a92ac71b7b5fb7cd93fc7aa7c9cc1e6751"
+      }
+    },
+    {
+      "profile": "s2-epoch-maintenance",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2,non-strapping-user-presence,release-flash-encryption,signed-ab-update,usb-signed-update,security-epoch-maintenance",
+        "--bin",
+        "salpa",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    },
+    {
+      "profile": "s2-signed-ab",
+      "check": "build",
+      "command": [
+        "./tools/cargo-esp",
+        "build",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2,usb-signed-update",
+        "--bin",
+        "salpa"
+      ],
+      "passed": true,
+      "elf_bytes": 581644,
+      "elf_sha256": "36d9f452eabd82fdc2082a031a4c66607041c1614f9d9a053c1bbcf70b9033a9"
+    },
+    {
+      "profile": "s2-signed-ab",
+      "check": "clippy",
+      "command": [
+        "./tools/cargo-esp",
+        "clippy",
+        "--locked",
+        "--release",
+        "--no-default-features",
+        "--features",
+        "ctaphid-bringup,fido-stack,mcu-esp32s2,usb-signed-update",
+        "--bin",
+        "salpa",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "passed": true
+    }
+  ],
+  "protected_normal_comparison": {
+    "baseline": {
+      "schema": 1,
+      "iram_end": 1073905664,
+      "data_start": 1073446912,
+      "stack_reserved_bytes": 149332,
+      "handler_address": 1073893984,
+      "expected_permissions": [
+        1755,
+        434176,
+        0,
+        450887765,
+        30720,
+        0,
+        110592,
+        0
+      ],
+      "device_accessed": false,
+      "handler_has_no_calls_or_returns": true,
+      "elf_sha256": "389592d80f62502a36fd623c7a9858005271cb13749a51c79444dd05b6647d67",
+      "main_frame_allocation_bytes": 50240,
+      "main_prologue": [
+        "400ae7a0:\t004136        \tentry\ta1, 32",
+        "400ae7a3:\t4aae81        \tl32r\ta8, 4008125c <sym_esp32_init+0x120c> (c420 <RESERVE_CACHES+0x8420>)",
+        "400ae7a6:\tc08180        \tsub\ta8, a1, a8",
+        "400ae7a9:\t001810        \tmovsp\ta1, a8"
+      ]
+    },
+    "refactored": {
+      "schema": 1,
+      "iram_end": 1073905664,
+      "data_start": 1073446912,
+      "stack_reserved_bytes": 149332,
+      "handler_address": 1073893984,
+      "expected_permissions": [
+        1755,
+        434176,
+        0,
+        450887765,
+        30720,
+        0,
+        110592,
+        0
+      ],
+      "device_accessed": false,
+      "handler_has_no_calls_or_returns": true,
+      "elf_sha256": "ff61d0d34525a2c82700c4c99f133efe42835e19ecfbc33a8e8de826e044d89f",
+      "main_frame_allocation_bytes": 50240,
+      "main_prologue": [
+        "400ae7a0:\t004136        \tentry\ta1, 32",
+        "400ae7a3:\t4aae81        \tl32r\ta8, 4008125c <sym_esp32_init+0x120c> (c420 <RESERVE_CACHES+0x8420>)",
+        "400ae7a6:\tc08180        \tsub\ta8, a1, a8",
+        "400ae7a9:\t001810        \tmovsp\ta1, a8"
+      ]
+    }
+  },
+  "limits": [
+    "Host and compile-only fixture evidence; no operational keys, device writes or eFuse operations.",
+    "The helper was not installed. Real Keychain ACL and approval behavior was not requalified.",
+    "Firmware hardware acceptance remains bound to the previously recorded signed image, not these source changes.",
+    "Reserved stack space and static main-frame allocation are not measured peak stack use.",
+    "The refactored normal comparison used its own fresh build directory. An earlier shared-directory output was discarded as stale."
+  ]
+}

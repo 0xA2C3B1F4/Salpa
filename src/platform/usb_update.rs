@@ -6,6 +6,7 @@
 
 use crate::{
     platform::ota,
+    signed_image::ImageReader,
     usb_update::{
         OTA_SLOT_SIZE, RSA_PUBLIC_KEY_SIZE, RSA_SIGNATURE_SIZE, UpdateBackend, UpdateLayout,
     },
@@ -41,8 +42,6 @@ impl Esp32S2UpdateBackend {
 }
 
 impl UpdateBackend for Esp32S2UpdateBackend {
-    type Error = Error;
-
     fn now_ms(&self) -> u64 {
         esp_hal::time::Instant::now()
             .duration_since_epoch()
@@ -107,6 +106,41 @@ impl UpdateBackend for Esp32S2UpdateBackend {
             Ok(())
         }
     }
+
+    fn activate(
+        &mut self,
+        slot: u8,
+        sequence: u32,
+        activation_entry: u8,
+    ) -> Result<(), Self::Error> {
+        ota::activate_update(slot, sequence, activation_entry, self.descriptor_address)
+            .map_err(|_| Error::Ota)
+    }
+}
+
+pub const fn trusted_update_key_digest() -> [u8; 32] {
+    const HEX: &str = env!("SALPA_UPDATE_KEY_DIGEST_HEX");
+    let bytes = HEX.as_bytes();
+    assert!(bytes.len() == 64);
+    let mut output = [0; 32];
+    let mut index = 0;
+    while index < output.len() {
+        output[index] = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
+        index += 1;
+    }
+    output
+}
+
+const fn hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        _ => panic!("trusted update-key digest must be lowercase hexadecimal"),
+    }
+}
+
+impl ImageReader for Esp32S2UpdateBackend {
+    type Error = Error;
 
     fn read(&mut self, slot: u8, offset: u32, output: &mut [u8]) -> Result<(), Self::Error> {
         let address = Self::address(slot, offset, output.len())?;
@@ -193,36 +227,5 @@ impl UpdateBackend for Esp32S2UpdateBackend {
         signature.0.fill(0);
         verified.0.fill(0);
         Ok(matches)
-    }
-
-    fn activate(
-        &mut self,
-        slot: u8,
-        sequence: u32,
-        activation_entry: u8,
-    ) -> Result<(), Self::Error> {
-        ota::activate_update(slot, sequence, activation_entry, self.descriptor_address)
-            .map_err(|_| Error::Ota)
-    }
-}
-
-pub const fn trusted_update_key_digest() -> [u8; 32] {
-    const HEX: &str = env!("SALPA_UPDATE_KEY_DIGEST_HEX");
-    let bytes = HEX.as_bytes();
-    assert!(bytes.len() == 64);
-    let mut output = [0; 32];
-    let mut index = 0;
-    while index < output.len() {
-        output[index] = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
-        index += 1;
-    }
-    output
-}
-
-const fn hex_nibble(value: u8) -> u8 {
-    match value {
-        b'0'..=b'9' => value - b'0',
-        b'a'..=b'f' => value - b'a' + 10,
-        _ => panic!("trusted update-key digest must be lowercase hexadecimal"),
     }
 }

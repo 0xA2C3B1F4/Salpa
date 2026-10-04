@@ -12,6 +12,9 @@ pub mod request_completion;
 pub mod usb_identity;
 
 #[cfg(any(feature = "usb-signed-update", test))]
+pub mod signed_image;
+
+#[cfg(any(feature = "usb-signed-update", test))]
 pub mod usb_update;
 
 #[cfg(feature = "ctaphid-bringup")]
