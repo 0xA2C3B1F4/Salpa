@@ -519,6 +519,9 @@ impl PersistentState {
         &mut self,
         trussed: &mut T,
     ) -> Result<KeyEncryptionKey> {
+        if self.persistence_failed {
+            return Err(Error::Other);
+        }
         match self.key_encryption_key {
             Some(key) => Ok(KeyEncryptionKey(key)),
             None => self.rotate_key_encryption_key(trussed),
@@ -529,21 +532,40 @@ impl PersistentState {
         &mut self,
         trussed: &mut T,
     ) -> Result<KeyEncryptionKey> {
-        if let Some(key) = self.key_encryption_key {
-            syscall!(trussed.delete(key));
+        if self.persistence_failed {
+            return Err(Error::Other);
         }
-        let key = self
-            .credential_id_version()
-            .generate_key_encryption_key(trussed);
-        self.key_encryption_key = Some(key.0);
-        self.save(trussed)?;
-        Ok(key)
+        let result = (|| {
+            let old = self.key_encryption_key;
+            let key = self
+                .credential_id_version()
+                .generate_key_encryption_key(trussed)?;
+            self.key_encryption_key = Some(key.0);
+            // Publish the complete new key before deleting the old reference.
+            self.save(trussed)?;
+            if let Some(old) = old {
+                if !try_syscall!(trussed.delete(old))
+                    .map_err(|_| Error::Other)?
+                    .success
+                {
+                    return Err(Error::Other);
+                }
+            }
+            Ok(key)
+        })();
+        if result.is_err() {
+            self.latch_persistence_failure();
+        }
+        result
     }
 
     pub fn key_wrapping_key<T: CryptoClient + FilesystemClient>(
         &mut self,
         trussed: &mut T,
     ) -> Result<KeyWrappingKey> {
+        if self.persistence_failed {
+            return Err(Error::Other);
+        }
         match self.key_wrapping_key {
             Some(key) => Ok(KeyWrappingKey(key)),
             None => self.rotate_key_wrapping_key(trussed),
@@ -554,15 +576,30 @@ impl PersistentState {
         &mut self,
         trussed: &mut T,
     ) -> Result<KeyWrappingKey> {
-        if let Some(key) = self.key_wrapping_key {
-            syscall!(trussed.delete(key));
+        if self.persistence_failed {
+            return Err(Error::Other);
         }
-        let key = self
-            .credential_id_version()
-            .generate_key_wrapping_key(trussed);
-        self.key_wrapping_key = Some(key.0);
-        self.save(trussed)?;
-        Ok(key)
+        let result = (|| {
+            let old = self.key_wrapping_key;
+            let key = self
+                .credential_id_version()
+                .generate_key_wrapping_key(trussed)?;
+            self.key_wrapping_key = Some(key.0);
+            self.save(trussed)?;
+            if let Some(old) = old {
+                if !try_syscall!(trussed.delete(old))
+                    .map_err(|_| Error::Other)?
+                    .success
+                {
+                    return Err(Error::Other);
+                }
+            }
+            Ok(key)
+        })();
+        if result.is_err() {
+            self.latch_persistence_failure();
+        }
+        result
     }
 
     pub fn pin_is_set(&self) -> bool {
@@ -733,6 +770,15 @@ impl RuntimeState {
 
     pub fn clear_credential_cache(&mut self) {
         self.cached_credentials.clear()
+    }
+
+    /// Credential mutations and failed enumerations invalidate paths and cursors,
+    /// while preserving a healthy PIN token's permissions.
+    pub fn clear_credential_continuations(&mut self) {
+        self.cached_rp = None;
+        self.cached_rk = None;
+        self.active_get_assertion = None;
+        self.clear_credential_cache();
     }
 
     pub fn push_credential(&mut self, credential: CachedCredential) {

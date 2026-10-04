@@ -66,7 +66,12 @@ pub(super) fn run(usb0: USB0<'static>, usb_dp: GPIO20<'static>, usb_dm: GPIO19<'
                     }
                 }
                 Ok(false) => {}
-                Err(_) => panic!("invalid USB FIDO HID OUT report"),
+                Err(_) => {
+                    // A short or failed transfer cannot identify a trustworthy
+                    // channel. Drop the transaction and keep polling USB.
+                    #[cfg(feature = "ctaphid-bringup")]
+                    ctaphid.transport_error();
+                }
             }
         }
 
@@ -77,7 +82,7 @@ pub(super) fn run(usb0: USB0<'static>, usb_dp: GPIO20<'static>, usb_dm: GPIO19<'
                 match fido_usb.send(&packet) {
                     Ok(()) => ctaphid.packet_sent(),
                     Err(salpa::usb::ReportError::Usb(usb_device::UsbError::WouldBlock)) => {}
-                    Err(_) => panic!("failed to send USB FIDO HID IN report"),
+                    Err(_) => ctaphid.transport_error(),
                 }
             }
         }

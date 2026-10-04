@@ -25,6 +25,7 @@ sha2 = "0.10.9"
 tempfile = "3.23.0"
 trussed = { git = "https://github.com/solokeys/trussed", rev = "2ea719b28245f0e68960e99aab16131f7f14d8ff", features = [
     "virt",
+    "aes256-gcm",
 ] }
 trussed-core = { path = "../../third_party/trussed-core", features = [
     "filesystem-client",

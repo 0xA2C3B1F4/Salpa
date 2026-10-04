@@ -101,9 +101,10 @@ where
         let mut num_rks = 0;
 
         let mut maybe_next =
-            syscall!(self
+            try_syscall!(self
                 .trussed
                 .read_dir_first(Location::Internal, dir.clone(), None))
+            .map_err(|_| Error::Other)?
             .entry;
 
         while let Some(rp) = maybe_next {
@@ -113,7 +114,9 @@ where
             }
 
             num_rks += 1;
-            maybe_next = syscall!(self.trussed.read_dir_next()).entry;
+            maybe_next = try_syscall!(self.trussed.read_dir_next())
+                .map_err(|_| Error::Other)?
+                .entry;
         }
 
         Ok(num_rks)
@@ -122,13 +125,16 @@ where
     pub fn first_relying_party(&mut self) -> Result<Response> {
         info!("first rp");
 
+        self.state.runtime.cached_rp = None;
+
         let mut response = Response::default();
         let dir = PathBuf::from(RK_DIR);
 
         let maybe_first_rp =
-            syscall!(self
+            try_syscall!(self
                 .trussed
                 .read_dir_first(Location::Internal, dir.clone(), None))
+            .map_err(|_| Error::Other)?
             .entry;
 
         let Some(first_rp) = maybe_first_rp else {
@@ -144,9 +150,10 @@ where
             return Err(Error::Other);
         }
 
-        let first_credential_data = syscall!(self
+        let first_credential_data = try_syscall!(self
             .trussed
             .read_file(Location::Internal, first_rp.path().into()))
+        .map_err(|_| Error::Other)?
         .data;
 
         let credential = FullCredential::deserialize(&first_credential_data)?;
@@ -160,7 +167,10 @@ where
 
         let mut current_id_hex = get_rp_id_hex(&current_rp);
 
-        while let Some(entry) = syscall!(self.trussed.read_dir_next()).entry {
+        while let Some(entry) = try_syscall!(self.trussed.read_dir_next())
+            .map_err(|_| Error::Other)?
+            .entry
+        {
             let id_hex = get_rp_id_hex(&entry);
             if id_hex != current_id_hex {
                 total_rps += 1;
@@ -190,18 +200,19 @@ where
             .state
             .runtime
             .cached_rp
-            .clone()
+            .take()
             .ok_or(Error::NotAllowed)?;
 
         let filename = super::rp_file_name_prefix(&last_rp_id_hash);
 
         let dir = PathBuf::from(RK_DIR);
 
-        let maybe_next_rp = syscall!(self.trussed.read_dir_first_alphabetical(
+        let maybe_next_rp = try_syscall!(self.trussed.read_dir_first_alphabetical(
             Location::Internal,
             dir,
             Some(filename.clone())
         ))
+        .map_err(|_| Error::Other)?
         .entry;
 
         let mut response = Response::default();
@@ -217,7 +228,10 @@ where
             .as_str()
             .starts_with(filename.as_str()));
 
-        while let Some(entry) = syscall!(self.trussed.read_dir_next()).entry {
+        while let Some(entry) = try_syscall!(self.trussed.read_dir_next())
+            .map_err(|_| Error::Other)?
+            .entry
+        {
             let id_hex = get_rp_id_hex(&entry);
             if id_hex == current_id_hex {
                 continue;
@@ -228,9 +242,10 @@ where
                 return Err(Error::Other);
             }
 
-            let data = syscall!(self
+            let data = try_syscall!(self
                 .trussed
                 .read_file(Location::Internal, entry.path().into()))
+            .map_err(|_| Error::Other)?
             .data;
 
             let credential = FullCredential::deserialize(&data)?;
@@ -265,11 +280,12 @@ where
 
         let mut num_rks = 0;
 
-        let mut maybe_entry = syscall!(self.trussed.read_dir_first_alphabetical(
+        let mut maybe_entry = try_syscall!(self.trussed.read_dir_first_alphabetical(
             Location::Internal,
             PathBuf::from(RK_DIR),
             Some(rp_dir_start.clone())
         ))
+        .map_err(|_| Error::Other)?
         .entry;
 
         let mut first_rk = None;
@@ -294,7 +310,9 @@ where
             first_rk = first_rk.or(Some(entry));
             num_rks += 1;
 
-            maybe_entry = syscall!(self.trussed.read_dir_next()).entry;
+            maybe_entry = try_syscall!(self.trussed.read_dir_next())
+                .map_err(|_| Error::Other)?
+                .entry;
         }
 
         let first_rk = first_rk.ok_or(Error::NoCredentials)?;
@@ -331,15 +349,19 @@ where
         } = cache;
 
         let rp_id_hex = get_rp_id_hex_from_file_name(prev_filename.as_str());
-        syscall!(self.trussed.read_dir_first_alphabetical(
+        try_syscall!(self.trussed.read_dir_first_alphabetical(
             Location::Internal,
             PathBuf::from(RK_DIR),
             Some(prev_filename.clone()),
         ))
+        .map_err(|_| Error::Other)?
         .entry;
 
         // The previous entry was already read. Skip to the next
-        let Some(entry) = syscall!(self.trussed.read_dir_next()).entry else {
+        let Some(entry) = try_syscall!(self.trussed.read_dir_next())
+            .map_err(|_| Error::Other)?
+            .entry
+        else {
             return Err(Error::NoCredentials);
         };
 
@@ -373,7 +395,9 @@ where
         // totalCredentials (0x09): total number of credentials for this RP
         // credProtect (0x0A): credential protection policy
 
-        let serialized = syscall!(self.trussed.read_file(Location::Internal, rk_path.into(),)).data;
+        let serialized = try_syscall!(self.trussed.read_file(Location::Internal, rk_path.into(),))
+            .map_err(|_| Error::Other)?
+            .data;
 
         let credential = FullCredential::deserialize(&serialized)
             // this may be a confusing error message
@@ -438,7 +462,7 @@ where
     fn find_credential(
         &mut self,
         credential: &PublicKeyCredentialDescriptorRef<'_>,
-    ) -> Option<PathBuf> {
+    ) -> Result<Option<PathBuf>> {
         let credential_id_hash = self.hash(credential.id);
         let mut hex = [b'0'; 16];
         let hex_str = super::format_hex(&credential_id_hash[..8], &mut hex);
@@ -446,15 +470,17 @@ where
 
         let mut maybe_entry =
             try_syscall!(self.trussed.read_dir_first(Location::Internal, dir, None))
-                .ok()?
+                .map_err(|_| Error::Other)?
                 .entry;
         while let Some(entry) = maybe_entry {
             if entry.file_name().as_str().ends_with(&hex_str) {
-                return Some(entry.path().into());
+                return Ok(Some(entry.path().into()));
             }
-            maybe_entry = syscall!(self.trussed.read_dir_next()).entry;
+            maybe_entry = try_syscall!(self.trussed.read_dir_next())
+                .map_err(|_| Error::Other)?
+                .entry;
         }
-        None
+        Ok(None)
     }
 
     pub fn delete_credential(
@@ -463,7 +489,7 @@ where
     ) -> Result<Response> {
         info!("delete credential");
         let rk_path = self
-            .find_credential(credential_descriptor)
+            .find_credential(credential_descriptor)?
             .ok_or(Error::InvalidCredential)?;
 
         // DELETE
@@ -483,9 +509,11 @@ where
 
         // locate and parse existing credential
         let rk_path = self
-            .find_credential(credential_descriptor)
+            .find_credential(credential_descriptor)?
             .ok_or(Error::NoCredentials)?;
-        let serialized = syscall!(self.trussed.read_file(Location::Internal, rk_path.clone())).data;
+        let serialized = try_syscall!(self.trussed.read_file(Location::Internal, rk_path.clone()))
+            .map_err(|_| Error::Other)?
+            .data;
         let mut credential =
             FullCredential::deserialize(&serialized).map_err(|_| Error::InvalidCredential)?;
 
@@ -508,10 +536,14 @@ where
 
         // write updated credential
         let serialized = credential.serialize()?;
+        self.state.runtime.clear_credential_continuations();
         try_syscall!(self
             .trussed
             .write_file(Location::Internal, rk_path, serialized, None))
-        .map_err(|_| Error::KeyStoreFull)?;
+        .map_err(|_| {
+            self.state.persistent.latch_persistence_failure();
+            Error::KeyStoreFull
+        })?;
 
         Ok(Default::default())
     }

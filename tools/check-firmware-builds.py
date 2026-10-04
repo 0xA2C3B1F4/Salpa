@@ -51,6 +51,18 @@ PROFILES = {
         "salpa",
         ["ctaphid-bringup", "fido-stack", "mcu-esp32s3"],
     ),
+    "s2-usb-only": (
+        "esp32s2",
+        "legacy-0x8000",
+        "salpa",
+        ["usb-bringup", "mcu-esp32s2"],
+    ),
+    "s3-usb-only": (
+        "esp32s3",
+        "legacy-0x8000",
+        "salpa",
+        ["usb-bringup", "mcu-esp32s3"],
+    ),
     "s2-epoch-preview": (
         "esp32s2",
         "signed-ab-encrypted",

@@ -71,3 +71,38 @@ A fake monotonic clock exercises GetNextAssertion at 29,999, 30,000, 30,001 and
 failure. PIN-authorized continuations are covered for both PIN protocols.
 GetInfo is checked with Salpa's production configuration and both alwaysUv
 states: U2F must never be advertised by this CBOR-only transport.
+
+CredentialManagement tests authenticate synthetic requests with both PIN
+protocols and fail directory-start, directory-next and credential-file reads.
+Read errors return `Other`, discard enumeration cursors, and permit a new
+enumeration after I/O is restored. Empty stores, unknown credential IDs and
+an update with the wrong user ID retain their previous CTAP status. These
+targeted read tests restore I/O before the next dispatch; they do not establish
+that every PIN or crypto operation tolerates a globally unavailable backend.
+
+Successful credential deletion and user updates clear RP, credential and
+GetNextAssertion continuations while retaining the healthy PIN grant. Faults
+before and after record removal, private-key deletion and user-record writes
+must return an error and latch the instance closed. Fresh virtual platforms
+open the actual LittleFS image, check committed records, exercise unaffected
+credentials and verify the synthetic attestation key and certificate remain
+byte-identical. Record removal precedes private-key deletion, so an interrupted
+deletion can leave an unreferenced key file. A failed deletion does not promise
+complete revocation or automatic cleanup.
+
+Trussed can report a filesystem key-removal failure as
+`Ok(Delete { success: false })`. Credential deletion and rotation expect their
+old key to exist, so this reply must also return `Other` and latch the runtime.
+Tests inject that false reply both before and after the actual key deletion,
+then reopen storage and check the private-key presence or saved key reference.
+Idempotent reset and resident-replacement recovery still tolerate an already
+removed key.
+
+KEK and KWK tests cover both credential-ID versions, lazy creation and explicit
+rotation, with errors before and after generation, state writes and old-key
+deletion. Cached getters and further rotations reject a latched instance.
+After reopening the image, tests use real encryption to check the committed
+key reference, verify the other key kind is preserved, rotate successfully,
+and perform a nonresident credential creation and assertion. Generation or
+cleanup failures may leave unreferenced key files; the test does not claim
+that the multi-operation rotation is transactional.

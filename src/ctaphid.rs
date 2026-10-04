@@ -654,6 +654,43 @@ mod tests {
     }
 
     #[test]
+    fn transport_failure_discards_partial_transfers_and_preserves_channel() {
+        for during_transmit in [false, true] {
+            let mut engine = CtapHid::<128>::new(VERSION, CAPABILITIES);
+            let channel = allocate(&mut engine);
+            if during_transmit {
+                engine.ingest(&request_packet(channel, Command::Cbor, &[4]), 1);
+                engine.reply_cbor(&[0x5a; 100]).unwrap();
+                let packet = engine.next_packet().unwrap();
+                // WouldBlock leaves the same packet pending for retry.
+                assert_eq!(engine.next_packet(), Some(packet));
+                engine.packet_sent();
+                assert!(engine.next_packet().is_some());
+            } else {
+                engine.ingest(&request_packet(channel, Command::Cbor, &[0x5a; 100]), 1);
+                assert!(engine.request_payload().is_none());
+                assert!(engine.receive.is_some());
+            }
+            engine.transport_error();
+            assert!(engine.next_packet().is_none());
+            assert!(engine.request_payload().is_none());
+            assert!(engine.receive.is_none());
+            assert!(engine.request.iter().all(|byte| *byte == 0));
+            assert!(engine.response.iter().all(|byte| *byte == 0));
+            // A new request on the existing channel works without a reboot
+            // or a new INIT exchange after either direction fails.
+            assert!(matches!(
+                engine.ingest(&request_packet(channel, Command::Cbor, &[4]), 2),
+                Event::Cbor { .. }
+            ));
+            engine.reply_cbor(&[0]).unwrap();
+            assert_eq!(engine.next_packet().unwrap()[7], 0);
+            engine.packet_sent();
+            assert!(engine.next_packet().is_none());
+        }
+    }
+
+    #[test]
     fn broadcast_init_allocates_channel_and_echoes_nonce() {
         let mut engine = CtapHid::<128>::new(VERSION, CAPABILITIES);
         let channel = allocate(&mut engine);

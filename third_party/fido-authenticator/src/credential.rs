@@ -59,23 +59,27 @@ impl CredentialIdVersion {
         }
     }
 
-    fn generate_key<T: CryptoClient>(&self, trussed: &mut T) -> KeyId {
-        syscall!(trussed.generate_key(
+    fn generate_key<T: CryptoClient>(&self, trussed: &mut T) -> Result<KeyId> {
+        Ok(try_syscall!(trussed.generate_key(
             self.mechanism(),
             StorageAttributes::new().set_persistence(Location::Internal)
         ))
-        .key
+        .map_err(|_| Error::Other)?
+        .key)
     }
 
     pub fn generate_key_encryption_key<T: CryptoClient>(
         &self,
         trussed: &mut T,
-    ) -> KeyEncryptionKey {
-        KeyEncryptionKey(self.generate_key(trussed))
+    ) -> Result<KeyEncryptionKey> {
+        self.generate_key(trussed).map(KeyEncryptionKey)
     }
 
-    pub fn generate_key_wrapping_key<T: CryptoClient>(&self, trussed: &mut T) -> KeyWrappingKey {
-        KeyWrappingKey(self.generate_key(trussed))
+    pub fn generate_key_wrapping_key<T: CryptoClient>(
+        &self,
+        trussed: &mut T,
+    ) -> Result<KeyWrappingKey> {
+        self.generate_key(trussed).map(KeyWrappingKey)
     }
 
     pub fn id<T: CryptoClient, C: Serialize>(
@@ -1156,7 +1160,7 @@ mod test {
     fn credential_ids() {
         trussed::virt::with_client(StoreConfig::ram(), "fido", |mut client| {
             let format = CredentialIdVersion::V1;
-            let kek = format.generate_key_encryption_key(&mut client);
+            let kek = format.generate_key_encryption_key(&mut client).unwrap();
             let nonce = ByteArray::new([0; 12]);
             let data = credential_data();
             let mut full_credential = FullCredential {
@@ -1220,7 +1224,7 @@ mod test {
         };
         trussed::virt::with_client(StoreConfig::ram(), "fido", |mut client| {
             let id_version = CredentialIdVersion::V1;
-            let kek = id_version.generate_key_encryption_key(&mut client);
+            let kek = id_version.generate_key_encryption_key(&mut client).unwrap();
             let rp_id_hash = syscall!(client.hash_sha256(rp_id.as_ref()))
                 .hash
                 .as_slice()

@@ -1,6 +1,5 @@
-//! Test the actual vendored PIN module with real Trussed crypto and a fake clock.
-//! Only Uptime is intercepted. No production clock override or test-approval
-//! feature is added to the authenticator or firmware.
+//! Host lifecycle tests with real Trussed crypto, a fake clock and selected I/O faults.
+//! No production clock override or test-approval feature is added to the firmware.
 
 use super::pin::{PinProtocol, PinProtocolState, PinProtocolVersion, RpScope, SharedSecret};
 use core::{task::Poll, time::Duration};
@@ -21,7 +20,7 @@ use trussed_core::{
     api::{self, Reply, RequestVariant, reply},
     mechanisms::{HmacSha256, P256},
     serde_extensions::{Extension, ExtensionClient},
-    syscall,
+    syscall, try_syscall,
     types::Location,
 };
 use trussed_hkdf::HkdfClient;
@@ -41,6 +40,9 @@ enum FaultTarget {
     StateWrite(usize),
     RemoveFile(&'static littlefs2_core::Path),
     DeleteAll(Location),
+    ReadDirFirst,
+    ReadDirNext(usize),
+    CredentialRead(usize),
 }
 
 #[derive(Default)]
@@ -52,6 +54,7 @@ struct StorageFault {
     offline: bool,
     target: Option<FaultTarget>,
     target_hits: usize,
+    false_delete: bool,
 }
 
 struct ClockClient<C> {
@@ -61,6 +64,7 @@ struct ClockClient<C> {
     inner: Rc<RefCell<C>>,
     clock: Clock,
     clock_reply: bool,
+    false_delete_reply: bool,
 }
 
 impl<C: PollClient> PollClient for ClockClient<C> {
@@ -95,9 +99,24 @@ impl<C: PollClient> PollClient for ClockClient<C> {
             (Some(FaultTarget::DeleteAll(location)), api::Request::DeleteAllKeys(delete)) => {
                 delete.location == *location
             }
+            (Some(FaultTarget::ReadDirFirst), api::Request::ReadDirFirst(_)) => true,
+            (Some(FaultTarget::ReadDirNext(n)), api::Request::ReadDirNext(_)) => {
+                let n = *n;
+                fault.target_hits += 1;
+                fault.target_hits == n
+            }
+            (Some(FaultTarget::CredentialRead(n)), api::Request::ReadFile(read))
+                if read.path.as_str().starts_with("rk/") =>
+            {
+                let n = *n;
+                fault.target_hits += 1;
+                fault.target_hits == n
+            }
             _ => false,
         };
         let hit = target_hit || (mutation && fault.at == Some(fault.count));
+        self.false_delete_reply =
+            hit && fault.false_delete && matches!(request, api::Request::Delete(_));
         if fault.offline || (hit && !fault.after) {
             fault.offline = true;
             self.fault_reply = true;
@@ -115,6 +134,9 @@ impl<C: PollClient> PollClient for ClockClient<C> {
 
     fn poll(&mut self) -> Poll<Result<Reply, trussed_core::Error>> {
         if core::mem::take(&mut self.fault_reply) {
+            if core::mem::take(&mut self.false_delete_reply) {
+                return Poll::Ready(Ok(reply::Delete { success: false }.into()));
+            }
             return Poll::Ready(Err(trussed_core::Error::FilesystemWriteFailure));
         }
         if core::mem::take(&mut self.clock_reply) {
@@ -130,7 +152,11 @@ impl<C: PollClient> PollClient for ClockClient<C> {
             let reply = self.inner.borrow_mut().poll();
             if reply.is_ready() && core::mem::take(&mut self.fail_after_reply) {
                 self.fault.borrow_mut().offline = true;
-                Poll::Ready(Err(trussed_core::Error::FilesystemWriteFailure))
+                if core::mem::take(&mut self.false_delete_reply) {
+                    Poll::Ready(Ok(reply::Delete { success: false }.into()))
+                } else {
+                    Poll::Ready(Err(trussed_core::Error::FilesystemWriteFailure))
+                }
             } else {
                 reply
             }
@@ -197,6 +223,7 @@ fn run_with_store_files(
                     inner: Rc::new(RefCell::new(inner)),
                     clock: clock.clone(),
                     clock_reply: false,
+                    false_delete_reply: false,
                 };
                 test(&mut client, clock);
             },
@@ -525,6 +552,7 @@ where
         inner: client.inner.clone(),
         clock: client.clock.clone(),
         clock_reply: false,
+        false_delete_reply: false,
     };
     let mut auth =
         fido_authenticator::Authenticator::new(copy, fido_authenticator::Silent {}, config);
@@ -1039,10 +1067,27 @@ fn make_credential<C>(
 where
     ClockClient<C>: fido_authenticator::TrussedRequirements,
 {
+    make_credential_for_rp(auth, user, resident, invalid_exclude, "example.com")
+}
+
+fn make_credential_for_rp<C>(
+    auth: &mut TestAuthenticator<C>,
+    user: u8,
+    resident: bool,
+    invalid_exclude: bool,
+    rp: &str,
+) -> Vec<u8>
+where
+    ClockClient<C>: fido_authenticator::TrussedRequirements,
+{
     // Synthetic RP/user and ES256, resident credential requested.
     let mut request = vec![1, if invalid_exclude { 0xa6 } else { 0xa5 }, 1, 0x58, 32];
     request.extend_from_slice(&[0x42; 32]);
-    request.extend_from_slice(b"\x02\xa1\x62id\x6bexample.com\x03\xa1\x62id\x41");
+    request.extend_from_slice(b"\x02\xa1\x62id");
+    assert!(rp.len() < 24);
+    request.push(0x60 + rp.len() as u8);
+    request.extend_from_slice(rp.as_bytes());
+    request.extend_from_slice(b"\x03\xa1\x62id\x41");
     request.push(user);
     request.extend_from_slice(b"\x04\x81\xa2\x63alg\x26\x64type\x6apublic-key\x07\xa1\x62rk");
     request.push(if resident { 0xf5 } else { 0xf4 });
@@ -1136,6 +1181,7 @@ fn salpa_get_info_never_advertises_ctap1() {
                 inner: client.inner.clone(),
                 clock: client.clock.clone(),
                 clock_reply: false,
+                false_delete_reply: false,
             };
             let mut auth = fido_authenticator::Authenticator::new(
                 copy,
@@ -1721,4 +1767,650 @@ fn replacement_at_the_credential_limit_preserves_the_new_key_on_rejected_additio
             cbor_smol::cbor_deserialize(&response[1..]).unwrap();
         assert_eq!(response.credential.id.as_slice(), new.as_slice());
     });
+}
+
+fn cbor_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() < 24 {
+        out.push(0x40 + bytes.len() as u8);
+    } else if bytes.len() < 256 {
+        out.extend_from_slice(&[0x58, bytes.len() as u8]);
+    } else {
+        out.push(0x59);
+        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    }
+    out.extend_from_slice(bytes);
+}
+
+fn cm_rp_parameters() -> Vec<u8> {
+    use sha2::Digest;
+    let mut parameters = vec![0xa1, 1];
+    cbor_bytes(&mut parameters, &Sha256::digest(b"example.com"));
+    parameters
+}
+
+fn cm_credential_parameters(id: &[u8], user: Option<u8>) -> Vec<u8> {
+    let mut parameters = vec![if user.is_some() { 0xa2 } else { 0xa1 }, 2];
+    parameters.extend_from_slice(b"\xa2\x62id");
+    cbor_bytes(&mut parameters, id);
+    parameters.extend_from_slice(b"\x64type\x6apublic-key");
+    if let Some(user) = user {
+        parameters.extend_from_slice(b"\x03\xa3\x62id\x41");
+        parameters.push(user);
+        parameters.extend_from_slice(b"\x64name\x67updated\x6bdisplayName\x67Updated");
+    }
+    parameters
+}
+
+fn management<C>(
+    auth: &mut TestAuthenticator<C>,
+    version: PinProtocolVersion,
+    token: &[u8],
+    sub: u8,
+    parameters: Option<&[u8]>,
+) -> Vec<u8>
+where
+    ClockClient<C>: fido_authenticator::TrussedRequirements,
+{
+    let mut signed = vec![sub];
+    if let Some(parameters) = parameters {
+        signed.extend_from_slice(parameters);
+    }
+    let sig = signature(token, version, &signed);
+    let mut request = vec![0x0a, if parameters.is_some() { 0xa4 } else { 0xa3 }, 1, sub];
+    if let Some(parameters) = parameters {
+        request.push(2);
+        request.extend_from_slice(parameters);
+    }
+    request.extend_from_slice(&[3, u8::from(version), 4]);
+    cbor_bytes(&mut request, &sig);
+    command(auth, &request)
+}
+
+fn management_response(response: &[u8]) -> ctap_types::ctap2::credential_management::Response {
+    assert_eq!(response[0], 0);
+    cbor_smol::cbor_deserialize(&response[1..]).unwrap()
+}
+
+fn management_token<C: PollClient>(
+    client: &mut ClockClient<C>,
+    auth: &mut TestAuthenticator<C>,
+    version: PinProtocolVersion,
+) -> Vec<u8>
+where
+    ClockClient<C>: fido_authenticator::TrussedRequirements,
+{
+    set_or_change_pin(client, auth, version, None, "synthetic-pin");
+    grant(client, auth, version, "synthetic-pin", 4, None).unwrap()
+}
+
+#[test]
+fn credential_management_read_errors_clear_cursors_and_allow_a_fresh_retry() {
+    for version in [PinProtocolVersion::V1, PinProtocolVersion::V2] {
+        for sub in 1..=7 {
+            let mut targets = vec![FaultTarget::ReadDirFirst, FaultTarget::ReadDirNext(1)];
+            if sub != 1 {
+                targets.push(FaultTarget::CredentialRead(1));
+            }
+            for target in targets {
+                run(|client, _| {
+                    let mut auth = authenticator(client);
+                    let id = created_id(&make_resident(&mut auth, 7));
+                    assert_eq!(make_resident(&mut auth, 8)[0], 0);
+                    assert_eq!(
+                        make_credential_for_rp(&mut auth, 9, true, false, "other.test")[0],
+                        0
+                    );
+                    let token = management_token(client, &mut auth, version);
+                    let rp = cm_rp_parameters();
+                    assert_eq!(management(&mut auth, version, &token, 2, None)[0], 0);
+                    assert_eq!(management(&mut auth, version, &token, 4, Some(&rp))[0], 0);
+                    // A missing descriptor forces lookup to walk beyond the first
+                    // entry; real IDs are used for targeted credential-file reads.
+                    let descriptor = if matches!(target, FaultTarget::ReadDirNext(_)) {
+                        &[0][..]
+                    } else {
+                        &id[..]
+                    };
+                    let credential = cm_credential_parameters(descriptor, (sub == 7).then_some(7));
+                    let parameters = match sub {
+                        4 => Some(rp.as_slice()),
+                        6 | 7 => Some(credential.as_slice()),
+                        _ => None,
+                    };
+                    *client.fault.borrow_mut() = StorageFault {
+                        target: Some(target),
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        management(&mut auth, version, &token, sub, parameters),
+                        [Error::Other as u8]
+                    );
+                    assert!(client.fault.borrow().offline);
+                    // Restore I/O before the next dispatch. This tests a failed
+                    // filesystem read, not unavailable PIN cleanup or uptime.
+                    *client.fault.borrow_mut() = StorageFault::default();
+                    assert_eq!(
+                        management(&mut auth, version, &token, 3, None),
+                        [Error::NotAllowed as u8]
+                    );
+                    assert_eq!(
+                        management(&mut auth, version, &token, 5, None),
+                        [Error::NotAllowed as u8]
+                    );
+                    let metadata =
+                        management_response(&management(&mut auth, version, &token, 1, None));
+                    assert_eq!(metadata.existing_resident_credentials_count, Some(3));
+                    assert_eq!(management(&mut auth, version, &token, 2, None)[0], 0);
+                    assert_eq!(management(&mut auth, version, &token, 3, None)[0], 0);
+                    assert_eq!(management(&mut auth, version, &token, 4, Some(&rp))[0], 0);
+                    assert_eq!(management(&mut auth, version, &token, 5, None)[0], 0);
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn resident_lookup_read_errors_preserve_existing_credentials() {
+    for target in [
+        FaultTarget::ReadDirFirst,
+        FaultTarget::ReadDirNext(1),
+        FaultTarget::CredentialRead(1),
+    ] {
+        run(|client, _| {
+            let mut auth = authenticator(client);
+            let id = created_id(&make_resident(&mut auth, 7));
+            *client.fault.borrow_mut() = StorageFault {
+                target: Some(target),
+                ..Default::default()
+            };
+            assert_eq!(make_resident(&mut auth, 8), [Error::Other as u8]);
+            assert!(client.fault.borrow().offline);
+            *client.fault.borrow_mut() = StorageFault::default();
+            assert_eq!(allowlist_assertion(&mut auth, &id)[0], 0);
+            assert_eq!(make_resident(&mut auth, 8)[0], 0);
+        });
+    }
+}
+
+#[test]
+fn credential_management_mutations_discard_continuations_but_keep_the_pin_grant() {
+    for version in [PinProtocolVersion::V1, PinProtocolVersion::V2] {
+        for sub in [6, 7] {
+            run(|client, _| {
+                let mut auth = authenticator(client);
+                let ids = [
+                    created_id(&make_resident(&mut auth, 7)),
+                    created_id(&make_resident(&mut auth, 8)),
+                ];
+                assert_eq!(
+                    make_credential_for_rp(&mut auth, 9, true, false, "other.test")[0],
+                    0
+                );
+                let token = management_token(client, &mut auth, version);
+                let rp = cm_rp_parameters();
+                assert_eq!(management(&mut auth, version, &token, 2, None)[0], 0);
+                assert_eq!(management(&mut auth, version, &token, 4, Some(&rp))[0], 0);
+                let first: ctap_types::ctap2::get_assertion::Response = {
+                    // Avoid consuming the PIN grant's presence permissions;
+                    // this host-only continuation requests no new user presence.
+                    let mut request = b"\x02\xa3\x01\x6bexample.com\x02\x58\x20".to_vec();
+                    request.extend_from_slice(&[0x43; 32]);
+                    request.extend_from_slice(b"\x05\xa1\x62up\xf4");
+                    let response = command(&mut auth, &request);
+                    assert_eq!(response[0], 0);
+                    cbor_smol::cbor_deserialize(&response[1..]).unwrap()
+                };
+                assert_eq!(first.number_of_credentials, Some(2));
+                let pending = usize::from(first.credential.id.as_slice() == ids[0]);
+                let parameters = cm_credential_parameters(
+                    &ids[pending],
+                    (sub == 7).then_some(7 + pending as u8),
+                );
+                let private_key = resident_private_key(client, 7 + pending as u8);
+                assert_eq!(
+                    management(&mut auth, version, &token, sub, Some(&parameters))[0],
+                    0
+                );
+                assert_eq!(
+                    syscall!(client.exists(trussed_core::types::Mechanism::P256, private_key))
+                        .exists,
+                    sub == 7
+                );
+                assert_eq!(command(&mut auth, &[8]), [Error::NotAllowed as u8]);
+                assert_eq!(
+                    management(&mut auth, version, &token, 3, None),
+                    [Error::NotAllowed as u8]
+                );
+                assert_eq!(
+                    management(&mut auth, version, &token, 5, None),
+                    [Error::NotAllowed as u8]
+                );
+                let metadata =
+                    management_response(&management(&mut auth, version, &token, 1, None));
+                assert_eq!(
+                    metadata.existing_resident_credentials_count,
+                    Some(if sub == 6 { 2 } else { 3 })
+                );
+                if sub == 7 {
+                    let response =
+                        management_response(&management(&mut auth, version, &token, 4, Some(&rp)));
+                    let response = if response.credential_id.unwrap().id.as_slice() == ids[pending]
+                    {
+                        response.user.unwrap()
+                    } else {
+                        management_response(&management(&mut auth, version, &token, 5, None))
+                            .user
+                            .unwrap()
+                    };
+                    assert_eq!(response.name.as_deref(), Some("updated"));
+                }
+                if sub == 6 {
+                    assert_eq!(
+                        allowlist_assertion(&mut auth, &ids[pending]),
+                        [Error::NoCredentials as u8]
+                    );
+                }
+                assert_eq!(allowlist_assertion(&mut auth, &ids[1 - pending])[0], 0);
+            });
+        }
+    }
+}
+
+#[test]
+fn credential_management_empty_store_and_missing_credentials_keep_their_status() {
+    run(|client, _| {
+        let mut auth = authenticator(client);
+        let version = PinProtocolVersion::V2;
+        let token = management_token(client, &mut auth, version);
+        let metadata = management_response(&management(&mut auth, version, &token, 1, None));
+        assert_eq!(metadata.existing_resident_credentials_count, Some(0));
+        let rps = management_response(&management(&mut auth, version, &token, 2, None));
+        assert_eq!(rps.total_rps, Some(0));
+        assert_eq!(
+            management(&mut auth, version, &token, 4, Some(&cm_rp_parameters())),
+            [Error::NoCredentials as u8]
+        );
+        assert_eq!(
+            management(
+                &mut auth,
+                version,
+                &token,
+                6,
+                Some(&cm_credential_parameters(&[0], None))
+            ),
+            [Error::InvalidCredential as u8]
+        );
+        assert_eq!(
+            management(
+                &mut auth,
+                version,
+                &token,
+                7,
+                Some(&cm_credential_parameters(&[0], Some(7)))
+            ),
+            [Error::NoCredentials as u8]
+        );
+    });
+    run(|client, _| {
+        let mut auth = authenticator(client);
+        let id = created_id(&make_resident(&mut auth, 7));
+        let version = PinProtocolVersion::V2;
+        let token = management_token(client, &mut auth, version);
+        *client.fault.borrow_mut() = StorageFault::default();
+        assert_eq!(
+            management(
+                &mut auth,
+                version,
+                &token,
+                7,
+                Some(&cm_credential_parameters(&id, Some(99)))
+            ),
+            [Error::InvalidParameter as u8]
+        );
+        assert_eq!(client.fault.borrow().count, 0);
+        assert_eq!(
+            management_response(&management(&mut auth, version, &token, 1, None))
+                .existing_resident_credentials_count,
+            Some(1)
+        );
+        assert_eq!(allowlist_assertion(&mut auth, &id)[0], 0);
+    });
+}
+
+fn resident_private_key<C: PollClient>(
+    client: &mut ClockClient<C>,
+    user: u8,
+) -> trussed_core::types::KeyId {
+    use fido_authenticator::credential::{FullCredential, Key};
+    use trussed_core::FilesystemClient;
+    let mut next = syscall!(client.read_dir_first(
+        Location::Internal,
+        littlefs2_core::path!("rk").into(),
+        None
+    ))
+    .entry;
+    while let Some(entry) = next {
+        let record = syscall!(client.read_file(Location::Internal, entry.path().into())).data;
+        let credential = FullCredential::deserialize(&record).unwrap();
+        if credential.user.id().as_slice() == [user] {
+            if let Key::ResidentKey(key) = credential.key {
+                return key;
+            }
+        }
+        next = syscall!(client.read_dir_next()).entry;
+    }
+    panic!("synthetic resident credential missing")
+}
+
+#[test]
+fn credential_management_mutation_errors_latch_and_reopen_only_committed_records() {
+    use trussed::{
+        key::{Flags, Key, Kind},
+        platform::Platform as _,
+        store::Store as _,
+    };
+    let key_path = littlefs2_core::path!("fido/sec/00");
+    let cert_path = littlefs2_core::path!("fido/x5c/00");
+    // Synthetic special-ID identity, unrelated to all physical device identities.
+    let attestation_key = Key {
+        flags: Flags::SENSITIVE,
+        kind: Kind::P256,
+        material: [1; 32].as_slice().try_into().unwrap(),
+    }
+    .serialize();
+    let mut certificate = vec![
+        0x06, 0x0b, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xe5, 0x1c, 0x01, 0x01, 0x04, 0x04, 0x12,
+        0x04, 0x10,
+    ];
+    certificate.extend_from_slice(&[0xa5; 16]);
+    for version in [PinProtocolVersion::V1, PinProtocolVersion::V2] {
+        for sub in [6, 7] {
+            for at in 1..=if sub == 6 { 2 } else { 1 } {
+                for false_delete in [false, true] {
+                    if false_delete && (sub != 6 || at != 2) {
+                        continue;
+                    }
+                    for after in [false, true] {
+                        let directory = tempfile::Builder::new()
+                            .prefix("salpa-management-fault-")
+                            .tempdir_in(std::env::var_os("TMPDIR").unwrap())
+                            .unwrap();
+                        let image = directory.path().join("internal.store");
+                        let mut id = Vec::new();
+                        let mut unaffected = Vec::new();
+                        let mut private_key = None;
+                        run_with_store_files(
+                            filesystem_store(&image),
+                            &[(key_path, &attestation_key), (cert_path, &certificate)],
+                            |client, _| {
+                                let mut auth = authenticator(client);
+                                id = created_id(&make_resident(&mut auth, 7));
+                                unaffected = created_id(&make_resident(&mut auth, 8));
+                                private_key = Some(resident_private_key(client, 7));
+                                let token = management_token(client, &mut auth, version);
+                                let parameters =
+                                    cm_credential_parameters(&id, (sub == 7).then_some(7));
+                                *client.fault.borrow_mut() = StorageFault {
+                                    at: Some(at),
+                                    after,
+                                    false_delete,
+                                    ..Default::default()
+                                };
+                                assert_eq!(
+                                    management(&mut auth, version, &token, sub, Some(&parameters)),
+                                    [if sub == 6 {
+                                        Error::Other as u8
+                                    } else {
+                                        Error::KeyStoreFull as u8
+                                    }]
+                                );
+                                assert!(client.fault.borrow().offline);
+                                assert_latched(&mut auth, client);
+                            },
+                        );
+                        run_with_store(filesystem_store(&image), |client, _| {
+                            let mut auth = reopen(client);
+                            assert_eq!(
+                                syscall!(client.exists(
+                                    trussed_core::types::Mechanism::P256,
+                                    private_key.unwrap()
+                                ))
+                                .exists,
+                                !(sub == 6 && at == 2 && after)
+                            );
+                            assert_eq!(allowlist_assertion(&mut auth, &unaffected)[0], 0);
+                            let token = grant(client, &mut auth, version, "synthetic-pin", 4, None)
+                                .unwrap();
+                            let metadata = management_response(&management(
+                                &mut auth, version, &token, 1, None,
+                            ));
+                            let removed = sub == 6 && (at > 1 || after);
+                            assert_eq!(
+                                metadata.existing_resident_credentials_count,
+                                Some(if removed { 1 } else { 2 })
+                            );
+                            if sub == 7 {
+                                let rp = cm_rp_parameters();
+                                let response = management_response(&management(
+                                    &mut auth,
+                                    version,
+                                    &token,
+                                    4,
+                                    Some(&rp),
+                                ));
+                                let user = if response.credential_id.unwrap().id.as_slice() == id {
+                                    response.user.unwrap()
+                                } else {
+                                    management_response(&management(
+                                        &mut auth, version, &token, 5, None,
+                                    ))
+                                    .user
+                                    .unwrap()
+                                };
+                                assert_eq!(user.name.as_deref(), after.then_some("updated"));
+                            }
+                            assert_eq!(
+                                allowlist_assertion(&mut auth, &id)[0],
+                                if removed {
+                                    Error::NoCredentials as u8
+                                } else {
+                                    0
+                                }
+                            );
+                        });
+                        virt::with_platform(filesystem_store(&image), |platform| {
+                            for (path, expected) in [
+                                (key_path, attestation_key.as_slice()),
+                                (cert_path, certificate.as_slice()),
+                            ] {
+                                assert_eq!(
+                                    platform
+                                        .store()
+                                        .ifs()
+                                        .read::<heapless_bytes::Bytes<256>>(path)
+                                        .unwrap()
+                                        .as_slice(),
+                                    expected
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn persistent_key_rotation_errors_never_return_cached_keys_and_reopen_committed_references() {
+    use fido_authenticator::{credential::CredentialIdVersion, state::PersistentState};
+    use trussed_core::types::Mechanism;
+    for version in [CredentialIdVersion::V1, CredentialIdVersion::V2] {
+        for wrapping in [false, true] {
+            for existing in [false, true] {
+                for at in 1..=if existing { 3 } else { 2 } {
+                    for false_delete in [false, true] {
+                        if false_delete && (!existing || at != 3) {
+                            continue;
+                        }
+                        for after in [false, true] {
+                            let directory = tempfile::Builder::new()
+                                .prefix("salpa-key-rotation-fault-")
+                                .tempdir_in(std::env::var_os("TMPDIR").unwrap())
+                                .unwrap();
+                            let image = directory.path().join("internal.store");
+                            let mut old = None;
+                            let mut unaffected = None;
+                            run_with_store(filesystem_store(&image), |client, _| {
+                                drop(authenticator(client));
+                                let mut config = fido_authenticator::Config::new(1024);
+                                config.credential_id_version = Some(version);
+                                let mut state = PersistentState::default();
+                                state.load_if_not_initialised(client, &config).unwrap();
+                                state.reset(client, &config).unwrap();
+                                unaffected = Some(if wrapping {
+                                    state.key_encryption_key(client).unwrap().0
+                                } else {
+                                    state.key_wrapping_key(client).unwrap().0
+                                });
+                                if existing {
+                                    old = Some(if wrapping {
+                                        state.key_wrapping_key(client).unwrap().0
+                                    } else {
+                                        state.key_encryption_key(client).unwrap().0
+                                    });
+                                }
+                                *client.fault.borrow_mut() = StorageFault {
+                                    at: Some(at),
+                                    after,
+                                    false_delete,
+                                    ..Default::default()
+                                };
+                                let result = if wrapping {
+                                    state.rotate_key_wrapping_key(client).map(|key| key.0)
+                                } else {
+                                    state.rotate_key_encryption_key(client).map(|key| key.0)
+                                };
+                                assert_eq!(result, Err(Error::Other));
+                                assert!(client.fault.borrow().offline);
+                                *client.fault.borrow_mut() = StorageFault::default();
+                                assert_eq!(
+                                    state.key_encryption_key(client).map(|key| key.0),
+                                    Err(Error::Other)
+                                );
+                                assert_eq!(
+                                    state.key_wrapping_key(client).map(|key| key.0),
+                                    Err(Error::Other)
+                                );
+                                assert_eq!(
+                                    state.rotate_key_encryption_key(client).map(|key| key.0),
+                                    Err(Error::Other)
+                                );
+                                assert_eq!(
+                                    state.rotate_key_wrapping_key(client).map(|key| key.0),
+                                    Err(Error::Other)
+                                );
+                                assert_eq!(state.save(client), Err(Error::Other));
+                                assert_eq!(client.fault.borrow().count, 0);
+                            });
+                            run_with_store(filesystem_store(&image), |client, _| {
+                                let config = fido_authenticator::Config::new(1024);
+                                let mut state = PersistentState::default();
+                                state.load_if_not_initialised(client, &config).unwrap();
+                                client.fault.borrow_mut().count = 0;
+                                let key = if wrapping {
+                                    state.key_wrapping_key(client).unwrap().0
+                                } else {
+                                    state.key_encryption_key(client).unwrap().0
+                                };
+                                let mechanism = match version {
+                                    CredentialIdVersion::V1 => Mechanism::Chacha8Poly1305,
+                                    CredentialIdVersion::V2 => Mechanism::Aes256Gcm,
+                                };
+                                // The symmetric mechanisms do not implement Exists.
+                                // A real encryption proves the referenced key can be read.
+                                let encrypted = syscall!(client.encrypt(
+                                    mechanism,
+                                    key,
+                                    b"synthetic",
+                                    b"",
+                                    None
+                                ));
+                                assert!(!encrypted.ciphertext.is_empty());
+                                let committed = at > 2 || (at == 2 && after);
+                                assert_eq!(
+                                    client.fault.borrow().count,
+                                    if !existing && !committed { 2 } else { 0 }
+                                );
+                                if let Some(old) = old {
+                                    assert_eq!(key != old, committed);
+                                    assert_eq!(
+                                        try_syscall!(client.encrypt(
+                                            mechanism,
+                                            old,
+                                            b"synthetic",
+                                            b"",
+                                            None
+                                        ))
+                                        .is_ok(),
+                                        !(at == 3 && after)
+                                    );
+                                }
+                                let other = if wrapping {
+                                    state.key_encryption_key(client).unwrap().0
+                                } else {
+                                    state.key_wrapping_key(client).unwrap().0
+                                };
+                                assert_eq!(Some(other), unaffected);
+                                // Successful explicit rotation must publish the new key,
+                                // remove the previous key, and retain the other key kind.
+                                let next = if wrapping {
+                                    state.rotate_key_wrapping_key(client).unwrap().0
+                                } else {
+                                    state.rotate_key_encryption_key(client).unwrap().0
+                                };
+                                assert_ne!(next, key);
+                                assert!(
+                                    try_syscall!(client.encrypt(
+                                        mechanism,
+                                        next,
+                                        b"synthetic",
+                                        b"",
+                                        None
+                                    ))
+                                    .is_ok()
+                                );
+                                assert!(
+                                    try_syscall!(client.encrypt(
+                                        mechanism,
+                                        key,
+                                        b"synthetic",
+                                        b"",
+                                        None
+                                    ))
+                                    .is_err()
+                                );
+                                let stored = if wrapping {
+                                    state.key_wrapping_key(client).unwrap().0
+                                } else {
+                                    state.key_encryption_key(client).unwrap().0
+                                };
+                                assert_eq!(stored, next);
+                                let other_after = if wrapping {
+                                    state.key_encryption_key(client).unwrap().0
+                                } else {
+                                    state.key_wrapping_key(client).unwrap().0
+                                };
+                                assert_eq!(other_after, other);
+                                let mut auth = reopen(client);
+                                let id = created_id(&make_credential(&mut auth, 7, false, false));
+                                assert_eq!(allowlist_assertion(&mut auth, &id)[0], 0);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -1323,7 +1323,7 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
         let mut cred_mgmt = cm::CredentialManagement::new(self);
         let sub_parameters = &parameters.sub_command_params;
         // TODO: use custom enum of known commands
-        match parameters.sub_command {
+        let result = match parameters.sub_command {
             // 0x1
             Subcommand::GetCredsMetadata => cred_mgmt.get_creds_metadata(),
 
@@ -1376,7 +1376,11 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
             }
 
             _ => Err(Error::InvalidParameter),
+        };
+        if result.is_err() {
+            cred_mgmt.state.runtime.clear_credential_continuations();
         }
+        result
     }
 
     #[inline(never)]
@@ -2540,11 +2544,12 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
     ) -> Result<Option<(PathBuf, KeyId)>> {
         // Prepare to iterate over all credentials associated to RP.
         let file_name_prefix = rp_file_name_prefix(rp_id_hash);
-        let mut maybe_entry = syscall!(self.trussed.read_dir_first_alphabetical(
+        let mut maybe_entry = try_syscall!(self.trussed.read_dir_first_alphabetical(
             Location::Internal,
             PathBuf::from(RK_DIR),
             Some(file_name_prefix.clone())
         ))
+        .map_err(|_| Error::Other)?
         .entry;
 
         while let Some(entry) = maybe_entry.take() {
@@ -2568,7 +2573,9 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
 
             info_now!("checking RK {:?} for userId ", &rk_path);
             let credential_data =
-                syscall!(self.trussed.read_file(Location::Internal, rk_path.clone(),)).data;
+                try_syscall!(self.trussed.read_file(Location::Internal, rk_path.clone(),))
+                    .map_err(|_| Error::Other)?
+                    .data;
             let credential_maybe = FullCredential::deserialize(&credential_data);
 
             if let Ok(old_credential) = credential_maybe {
@@ -2583,7 +2590,9 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
             }
 
             // prepare for next loop iteration
-            maybe_entry = syscall!(self.trussed.read_dir_next()).entry;
+            maybe_entry = try_syscall!(self.trussed.read_dir_next())
+                .map_err(|_| Error::Other)?
+                .entry;
         }
 
         Ok(None)
@@ -2592,33 +2601,46 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
     #[inline(never)]
     pub(crate) fn delete_resident_key_by_path(&mut self, rk_path: &Path) -> Result<()> {
         info_now!("deleting RK {:?}", &rk_path);
-        let credential_data = syscall!(self
+        let credential_data = try_syscall!(self
             .trussed
             .read_file(Location::Internal, PathBuf::from(rk_path),))
+        .map_err(|_| Error::Other)?
         .data;
         let credential_maybe = FullCredential::deserialize(&credential_data);
-        // info_now!("deleting credential {:?}", &credential);
-
-        if let Ok(credential) = credential_maybe {
-            match credential.key {
-                credential::Key::ResidentKey(key) => {
-                    info_now!(":: deleting resident key");
-                    syscall!(self.trussed.delete(key));
-                }
-                credential::Key::WrappedKey(_) => {}
+        let key = match credential_maybe {
+            Ok(credential) => match credential.key {
+                credential::Key::ResidentKey(key) => Some(key),
+                credential::Key::WrappedKey(_) => None,
+            },
+            Err(_) => {
+                // If for some reason there becomes a corrupt credential,
+                // we can still at least orphan the key rather then crash.
+                info_now!("Warning!  Orpaning a key.");
+                None
             }
-        } else {
-            // If for some reason there becomes a corrupt credential,
-            // we can still at least orphan the key rather then crash.
-            info_now!("Warning!  Orpaning a key.");
+        };
+        self.state.runtime.clear_credential_continuations();
+        let result = (|| {
+            // Remove the public record first so a failed key deletion cannot
+            // expose a credential whose private key was already removed.
+            try_syscall!(self
+                .trussed
+                .remove_file(Location::Internal, PathBuf::from(rk_path),))
+            .map_err(|_| Error::Other)?;
+            if let Some(key) = key {
+                if !try_syscall!(self.trussed.delete(key))
+                    .map_err(|_| Error::Other)?
+                    .success
+                {
+                    return Err(Error::Other);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.state.persistent.latch_persistence_failure();
         }
-
-        info_now!(":: deleting RK file {:?} itself", &rk_path);
-        syscall!(self
-            .trussed
-            .remove_file(Location::Internal, PathBuf::from(rk_path),));
-
-        Ok(())
+        result
     }
 
     fn large_blobs_get(

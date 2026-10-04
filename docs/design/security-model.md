@@ -29,11 +29,21 @@ an attacker with physical possession.
 - Missing, unreadable, or malformed `persistent-state.cbor` fails closed at the
   CTAP boundary. Normal firmware never replaces it with default PIN, retry,
   `alwaysUv`, counter, or key-reference state.
-- A failed persistent-state save or resident-credential cleanup during reset
-  blocks further CTAP requests in that runtime and discards cached
-  authorizations. The device must restart before using the persisted state
+- A failed storage mutation during persistent-state save, persistent key
+  rotation, resident-credential deletion or update, or reset cleanup blocks
+  further CTAP requests in that runtime and discards cached authorizations.
+  The device must restart before using the persisted state
   again; startup still rejects missing or malformed state. The separate
   signed-update path remains available.
+- Credential deletion removes the record before deleting its key. Key rotation
+  saves the replacement key reference before deleting the old key. These orders
+  avoid leaving a published record or state reference pointing to a deleted key
+  after an interrupted operation. An error can follow a completed mutation;
+  interrupted cleanup can leave key files until a successful reset. A failed
+  deletion is not proof of key erasure or credential revocation after reboot.
+- Credential-management read errors return a CTAP error and clear credential
+  continuations. They do not mark a persistent mutation as failed; a fresh
+  enumeration can proceed once storage reads work again.
 - Only an explicit provisioning image may authorize first state creation by
   writing a one-time marker. The authenticator saves valid initial state before
   it removes that marker.
