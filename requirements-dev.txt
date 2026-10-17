@@ -268,12 +268,12 @@ cryptography==50.0.1 \
     #   -r requirements-dev.in
     #   esptool
     #   fido2
-esp-pylib==1.1.4 \
+esp-pylib[cli,ide,serial]==1.1.4 \
     --hash=sha256:3e3a99e691e90a6355db04620aa91b578d154cfa6cbf5eb4c3cf7489d171a193 \
     --hash=sha256:dcbd717e8a0d7139d18c28352b637f0ee70fc8e40f0db1c090796c9fad16c89a
     # via esptool
-esptool==5.4.0 \
-    --hash=sha256:fd756598db0a26c9975fa18511b08687c54bf2ce7322ede80cf1f5117dad1f50
+esptool==5.5.0 \
+    --hash=sha256:cfc1d1c6d1699427451af1be7335efa835b7974c61ed86d77927d9553c443d57
     # via -r requirements-dev.in
 fido2==2.2.1 \
     --hash=sha256:85787428a94c3f8eaf72f0ff30afba983b559a1b1b795c93318c81b4ad4062c4 \
